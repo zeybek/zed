@@ -203,6 +203,8 @@ async fn test_postgres_session() {
     )
     .await;
     assert!(error.contains("single statement"), "{error}");
+    let error = error_of(session.as_ref(), &format!("DROP TABLE {schema}.orders"), agent).await;
+    assert!(error.contains("read-only transaction"), "{error}");
     let events = collect(session.execute(format!("SELECT count(*) FROM {schema}.orders"), agent))
         .await
         .unwrap();
@@ -389,6 +391,32 @@ async fn test_mysql_session() {
     )
     .await;
     assert!(error.contains("single statement"), "{error}");
+    // DDL commits the read-only transaction implicitly, so it must be stopped by the session.
+    let probe = format!("{table}_agent_probe");
+    let error = error_of(
+        session.as_ref(),
+        &format!("CREATE TABLE {probe} (id INT)"),
+        agent,
+    )
+    .await;
+    assert!(error.contains("READ ONLY"), "{error}");
+    let error = error_of(session.as_ref(), &format!("DROP TABLE {table}"), agent).await;
+    assert!(error.contains("READ ONLY"), "{error}");
+    let events = run(
+        session.as_ref(),
+        &format!("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{probe}'"),
+    )
+    .await;
+    let ResultEvent::Rows(rows) = &events[1] else {
+        panic!("expected rows, got {:?}", events[1]);
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("0"));
+    // Afterwards, the session accepts writes again.
+    run(
+        session.as_ref(),
+        &format!("CREATE TABLE {probe} (id INT); DROP TABLE {probe}"),
+    )
+    .await;
 
     let read_only = resolved("ZED_DATABASE_TEST_MYSQL_URL", "mysql", |config| {
         config.read_only = true

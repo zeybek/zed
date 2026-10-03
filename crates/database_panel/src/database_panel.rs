@@ -105,7 +105,7 @@ const ACTION_NAMESPACE: &str = "database_panel";
 pub fn init(cx: &mut App) {
     database_core::init(cx);
 
-    cx.observe_new(|workspace: &mut Workspace, _, cx| {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
         });

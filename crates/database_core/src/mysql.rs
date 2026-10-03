@@ -26,6 +26,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct MysqlSession {
     conn: Arc<Mutex<Option<Conn>>>,
     cancel: Arc<MysqlCancel>,
+    read_only: bool,
 }
 
 impl Drop for MysqlSession {
@@ -135,6 +136,7 @@ pub async fn connect(
     Ok(MysqlSession {
         conn: Arc::new(Mutex::new(Some(conn))),
         cancel,
+        read_only: connection.read_only,
     })
 }
 
@@ -290,13 +292,16 @@ impl DatabaseSession for MysqlSession {
 
     fn execute(&self, sql: String, options: ExecOptions) -> ResultStream {
         let conn = self.conn.clone();
+        let session_read_only = self.read_only;
         ResultStream::spawn(Some(self.cancel.clone()), move |mut sender| async move {
             let mut guard = conn.lock_owned().await;
             let Some(conn) = guard.as_mut() else {
                 sender.send(Err(anyhow!("the connection is closed"))).await;
                 return;
             };
-            if let Err(error) = run_statement(conn, &sql, options, &mut sender).await {
+            if let Err(error) =
+                run_statement(conn, &sql, options, session_read_only, &mut sender).await
+            {
                 sender.send(Err(error)).await;
             }
         })
@@ -315,9 +320,13 @@ async fn run_statement(
     conn: &mut Conn,
     sql: &str,
     options: ExecOptions,
+    session_read_only: bool,
     sender: &mut ResultSender,
 ) -> Result<()> {
     if options.read_only_transaction {
+        // DDL implicitly commits the current transaction and then runs outside of it, so only a
+        // read-only session keeps it from changing the database.
+        conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
         conn.query_drop("START TRANSACTION READ ONLY").await?;
         // Prepared statements can't contain more than one statement, so the transaction can't
         // be ended from within the input.
@@ -326,6 +335,9 @@ async fn run_statement(
             Err(error) => Err(anyhow!(error).context("agent queries must be a single statement")),
         };
         conn.query_drop("ROLLBACK").await?;
+        if !session_read_only {
+            conn.query_drop("SET SESSION TRANSACTION READ WRITE").await?;
+        }
         return result;
     }
     let result = conn.query_iter(sql).await?;
