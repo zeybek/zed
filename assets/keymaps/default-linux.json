@@ -1694,6 +1694,12 @@
     },
   },
   {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "ctrl-k enter": "database_panel::RunEmbeddedQuery",
+    },
+  },
+  {
     "context": "Editor && sql_editor",
     "bindings": {
       "ctrl-enter": "database_panel::RunQuery",
@@ -1702,6 +1708,7 @@
       "ctrl-k c": "database_panel::SelectConnection",
       "ctrl-k h": "database_panel::QueryHistory",
       "ctrl-k l": "database_panel::ExplainQuery",
+      "ctrl-k enter": "database_panel::RunQueryInline",
     },
   },
   {
