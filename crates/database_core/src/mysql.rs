@@ -17,6 +17,7 @@ use crate::{
         RelationKind, ResultEvent, ResultSender, ResultStream, RowBatcher, SchemaInfo, ValueKind,
         blob_value, display_value, qualified_name,
     },
+    statement::split_statements,
 };
 
 /// MySQL's character set number for binary strings.
@@ -324,15 +325,19 @@ async fn run_statement(
     sender: &mut ResultSender,
 ) -> Result<()> {
     if options.read_only_transaction {
+        anyhow::ensure!(
+            split_statements(sql).len() <= 1,
+            "agent queries must be a single statement"
+        );
         // DDL implicitly commits the current transaction and then runs outside of it, so only a
         // read-only session keeps it from changing the database.
         conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
         conn.query_drop("START TRANSACTION READ ONLY").await?;
-        // Prepared statements can't contain more than one statement, so the transaction can't
-        // be ended from within the input.
+        // Prepared statements can't contain more than one statement either, so the transaction
+        // can't be ended from within the input.
         let result = match conn.exec_iter(sql, ()).await {
             Ok(result) => stream_results(result, sender).await,
-            Err(error) => Err(anyhow!(error).context("agent queries must be a single statement")),
+            Err(error) => Err(error.into()),
         };
         conn.query_drop("ROLLBACK").await?;
         if !session_read_only {

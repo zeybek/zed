@@ -663,16 +663,20 @@ pub fn run_stdio_bridge(socket: &str) -> Result<()> {
         .with_context(|| format!("connecting to {socket}"))?
         .into_split();
 
-    let output = std::thread::spawn(move || -> io::Result<u64> {
+    std::thread::spawn(move || {
         let mut stdout = io::stdout();
-        io::copy(&mut socket_reader, &mut stdout)
+        let copied = io::copy(&mut socket_reader, &mut stdout);
+        let flushed = io::Write::flush(&mut stdout);
+        // Zed closed the connection, so there's nothing left to bridge.
+        std::process::exit(if copied.is_ok() && flushed.is_ok() {
+            0
+        } else {
+            1
+        });
     });
     io::copy(&mut io::stdin(), &mut socket_writer)?;
-    // The client closed stdin; closing the socket ends the connection.
-    drop(socket_writer);
-    output
-        .join()
-        .map_err(|_| anyhow!("the output thread panicked"))??;
+    // The client closed stdin and expects no more output. Returning exits the process, which
+    // closes the connection; dropping `socket_writer` alone wouldn't, since the reader shares it.
     Ok(())
 }
 
