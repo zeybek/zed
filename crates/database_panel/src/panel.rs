@@ -597,6 +597,31 @@ impl DatabasePanel {
         self.update_entries(cx);
     }
 
+    fn connection_tooltip(&self, config: &ConnectionConfig, cx: &App) -> SharedString {
+        let worktree_root = config.key.project_root.clone().or_else(|| {
+            self.project
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path())
+        });
+        let target = config
+            .sqlite_file_path(worktree_root.as_deref())
+            .map(SharedString::from)
+            .unwrap_or_else(|| config.display_target());
+        let mut tooltip = format!("{} · {}", config.driver.display_name(), target);
+        if config.key.is_from_project() {
+            tooltip.push_str(" · from project settings");
+        }
+        if config.has_password_in_settings() {
+            tooltip.push_str(
+                "\nThe connection URL contains a password. Settings files may be shared, \
+                 so prefer the keychain or an environment variable.",
+            );
+        }
+        tooltip.into()
+    }
+
     fn is_expandable(entry: &Entry) -> bool {
         matches!(
             entry.kind,
@@ -1044,6 +1069,13 @@ impl DatabasePanel {
                                         .color(Color::Muted),
                                 )
                             })
+                            .when(config.has_password_in_settings(), |row| {
+                                row.child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            })
                             .child(environment_label(config))
                             .child(status_indicator(&store.status(&config.key)))
                             .into_any_element(),
@@ -1103,16 +1135,7 @@ impl DatabasePanel {
             _ => None,
         };
         let tooltip = match &entry.kind {
-            EntryKind::Connection => Some(SharedString::from(format!(
-                "{} · {}{}",
-                config.driver.display_name(),
-                config.display_target(),
-                if config.key.is_from_project() {
-                    " · from project settings"
-                } else {
-                    ""
-                }
-            ))),
+            EntryKind::Connection => Some(self.connection_tooltip(config, cx)),
             EntryKind::Message(message, _) => Some(message.clone()),
             _ => None,
         };

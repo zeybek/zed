@@ -312,6 +312,25 @@ impl ConnectionConfig {
         target.into()
     }
 
+    /// The file a SQLite connection opens, resolved relative to `worktree_root`.
+    ///
+    /// Environment variables are not available before connecting, so a path that references
+    /// them is returned as written.
+    pub fn sqlite_file_path(&self, worktree_root: Option<&Path>) -> Option<String> {
+        if self.driver != DriverKind::Sqlite {
+            return None;
+        }
+        let path = self.path.as_deref()?;
+        match expand_variables(path, &HashMap::default(), worktree_root) {
+            Ok(expanded) => Some(
+                absolute_path(&expanded, worktree_root)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Err(_) => Some(path.to_string()),
+        }
+    }
+
     /// Whether the settings contain a literal password, which is shared with collaborators and
     /// remote hosts along with the settings file.
     pub fn has_password_in_settings(&self) -> bool {
@@ -675,6 +694,36 @@ mod tests {
         assert_eq!(resolved.port, 5432);
         assert_eq!(resolved.database.as_deref(), Some("app"));
         assert_eq!(resolved.password.as_deref(), Some("from keychain"));
+    }
+
+    #[test]
+    fn test_sqlite_file_path() {
+        let config = postgres(r#"{ "driver": "sqlite", "path": "db/dev.sqlite3" }"#);
+        assert_eq!(
+            config.sqlite_file_path(Some(Path::new("/work/app"))),
+            Some("/work/app/db/dev.sqlite3".to_string())
+        );
+        assert_eq!(
+            config.sqlite_file_path(None),
+            Some("db/dev.sqlite3".to_string())
+        );
+
+        let config = postgres(r#"{ "driver": "sqlite", "path": "$ZED_WORKTREE_ROOT/a.db" }"#);
+        assert_eq!(
+            config.sqlite_file_path(Some(Path::new("/work/app"))),
+            Some("/work/app/a.db".to_string())
+        );
+
+        let config = postgres(r#"{ "driver": "sqlite", "path": "${DATA_DIR}/a.db" }"#);
+        assert_eq!(
+            config.sqlite_file_path(Some(Path::new("/work/app"))),
+            Some("${DATA_DIR}/a.db".to_string())
+        );
+        assert_eq!(
+            postgres(r#"{ "driver": "postgres", "url": "postgres://localhost/app" }"#)
+                .sqlite_file_path(None),
+            None
+        );
     }
 
     #[test]
