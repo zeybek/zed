@@ -70,6 +70,8 @@ fn input(
         InputField::new(window, cx, placeholder)
             .label(label)
             .label_size(LabelSize::Small)
+            // The form lays fields out side by side, so they take their width from it.
+            .label_min_width(px(0.))
             .tab_stop(true)
     });
     if let Some(value) = value {
@@ -463,15 +465,15 @@ impl Render for ConnectionModal {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().flex_1().child(self.host.clone()))
-                            .child(div().w_24().child(self.port.clone())),
+                            .child(div().flex_1().min_w_0().child(self.host.clone()))
+                            .child(div().w_24().flex_none().child(self.port.clone())),
                     )
                     .child(self.database.clone())
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().flex_1().child(self.username.clone()))
-                            .child(div().flex_1().child(self.password.clone())),
+                            .child(div().flex_1().min_w_0().child(self.username.clone()))
+                            .child(div().flex_1().min_w_0().child(self.password.clone())),
                     )
                     .child(self.render_choice(
                         "ssl-mode",
@@ -531,15 +533,15 @@ impl Render for ConnectionModal {
                     form.child(
                         h_flex()
                             .gap_2()
-                            .child(div().flex_1().child(self.ssh_host.clone()))
-                            .child(div().flex_1().child(self.ssh_username.clone())),
+                            .child(div().flex_1().min_w_0().child(self.ssh_host.clone()))
+                            .child(div().flex_1().min_w_0().child(self.ssh_username.clone())),
                     )
                     .child(self.ssl_root_cert.clone())
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().flex_1().child(self.ssl_cert.clone()))
-                            .child(div().flex_1().child(self.ssl_key.clone())),
+                            .child(div().flex_1().min_w_0().child(self.ssl_cert.clone()))
+                            .child(div().flex_1().min_w_0().child(self.ssl_key.clone())),
                     )
                 })
             });
