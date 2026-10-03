@@ -27,6 +27,7 @@
   - [Debugger](./debugger.md)
   - [REPL](./repl.md)
 - [Git](./git.md)
+- [Database Panel](./database-panel.md)
 - [Modelines](./modelines.md)
 
 # Collaboration
