@@ -897,3 +897,23 @@ async fn test_running_statement_is_marked(cx: &mut TestAppContext) {
         assert!(!item.run().unwrap().read(cx).state.is_active());
     });
 }
+
+#[gpui::test]
+async fn test_typing_in_sql_editor(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let (project, window, workspace) = open_workspace(cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let editor = open_file(&project, &workspace, "query.sql", cx).await;
+    place_cursor(&editor, "", Point::zero(), cx);
+
+    // Typing asks the completion provider for schema names while the editor is being updated.
+    cx.simulate_input("select n");
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |editor, cx| editor.text(cx)),
+        "select n"
+    );
+}

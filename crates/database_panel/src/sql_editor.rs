@@ -13,6 +13,7 @@ use gpui::{
 };
 use language::{Buffer, BufferSnapshot, Point};
 use picker::{Picker, PickerDelegate};
+use project::Project;
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Color, Icon, IconButton, IconName, IconSize,
     Label, LabelSize, ListItem, ListItemSpacing, Tooltip, prelude::*,
@@ -207,11 +208,17 @@ impl editor::Addon for SqlEditorAddon {
 /// The root of the worktree that an editor's queries resolve against: the worktree of its file,
 /// or the project's first one for untitled buffers.
 pub(crate) fn editor_worktree_root(editor: &Editor, cx: &App) -> Option<Arc<Path>> {
-    let project = editor.project()?.read(cx);
-    let file_worktree = editor
-        .buffer()
-        .read(cx)
-        .as_singleton()
+    let buffer = editor.buffer().read(cx).as_singleton();
+    worktree_root(editor.project()?, buffer.as_ref(), cx)
+}
+
+fn worktree_root(
+    project: &Entity<Project>,
+    buffer: Option<&Entity<Buffer>>,
+    cx: &App,
+) -> Option<Arc<Path>> {
+    let project = project.read(cx);
+    let file_worktree = buffer
         .and_then(|buffer| buffer.read(cx).file().map(|file| file.worktree_id(cx)))
         .and_then(|worktree_id| project.worktree_for_id(worktree_id, cx))
         .filter(|worktree| worktree.read(cx).is_visible());
@@ -223,8 +230,21 @@ pub(crate) fn editor_worktree_root(editor: &Editor, cx: &App) -> Option<Arc<Path
 /// The connection an editor runs queries against: the one chosen for it, the one last chosen
 /// in its worktree, or the only one available.
 pub(crate) fn connection_for_editor(editor: &Entity<Editor>, cx: &App) -> Option<ConnectionConfig> {
-    let project = editor.read(cx).project()?.clone();
-    let connections = DbStore::connections_for_project(&project, cx);
+    let editor_state = editor.read(cx);
+    let project = editor_state.project()?;
+    let buffer = editor_state.buffer().read(cx).as_singleton();
+    connection_for_buffer(project, editor.entity_id(), buffer.as_ref(), cx)
+}
+
+/// Like [`connection_for_editor`], for callers that can't read the editor because it is being
+/// updated, such as its completion provider.
+pub(crate) fn connection_for_buffer(
+    project: &Entity<Project>,
+    editor_id: EntityId,
+    buffer: Option<&Entity<Buffer>>,
+    cx: &App,
+) -> Option<ConnectionConfig> {
+    let connections = DbStore::connections_for_project(project, cx);
     let store = DbStore::global(cx);
     let store = store.read(cx);
     let find = |key: &ConnectionKey| {
@@ -233,10 +253,10 @@ pub(crate) fn connection_for_editor(editor: &Entity<Editor>, cx: &App) -> Option
             .find(|connection| &connection.key == key)
             .cloned()
     };
-    if let Some(config) = store.editor_connection(editor.entity_id()).and_then(find) {
+    if let Some(config) = store.editor_connection(editor_id).and_then(find) {
         return Some(config);
     }
-    if let Some(config) = editor_worktree_root(editor.read(cx), cx)
+    if let Some(config) = worktree_root(project, buffer, cx)
         .and_then(|root| store.worktree_connection(&root).cloned())
         .and_then(|key| find(&key))
     {

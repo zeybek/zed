@@ -16,13 +16,15 @@ use project::{
 /// editor's connection. Replacing the provider outright would silently drop language server
 /// completions.
 pub struct SqlSchemaCompletionProvider {
+    project: Entity<Project>,
     inner: Rc<dyn CompletionProvider>,
 }
 
 impl SqlSchemaCompletionProvider {
     fn new(project: Entity<Project>) -> Self {
         Self {
-            inner: Rc::new(project),
+            inner: Rc::new(project.clone()),
+            project,
         }
     }
 }
@@ -275,8 +277,14 @@ impl CompletionProvider for SqlSchemaCompletionProvider {
         let inner = self
             .inner
             .completions(buffer, buffer_position, trigger, window, cx);
-        let editor = cx.entity();
-        let schema_response = crate::sql_editor::connection_for_editor(&editor, cx).map(|config| {
+        // The editor is being updated, so it can't be read here.
+        let schema_response = crate::sql_editor::connection_for_buffer(
+            &self.project,
+            cx.entity_id(),
+            Some(buffer),
+            cx,
+        )
+        .map(|config| {
             let snapshot = buffer.read(cx).snapshot();
             let offset = buffer_position.to_offset(&snapshot);
             let text = snapshot.text_for_range(0..offset).collect::<String>();
