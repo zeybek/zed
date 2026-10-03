@@ -389,15 +389,17 @@ impl InlineResultView {
     }
 }
 
-impl Render for InlineResultView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl InlineResultView {
+    fn status(&self, cx: &App) -> SharedString {
         let run = self.run.read(cx);
-        let em_width = window.text_style().font_size.to_pixels(window.rem_size()) * 0.62;
-        let status: SharedString = match &run.state {
+        match &run.state {
             QueryState::Connecting => "Connecting…".into(),
             QueryState::Running => "Running…".into(),
             QueryState::Failed(error) => error.clone(),
-            QueryState::Cancelled if self.truncated => {
+            // A fast query can finish before it is cancelled for having more rows than shown.
+            QueryState::Cancelled | QueryState::Finished | QueryState::Paused { .. }
+                if self.truncated =>
+            {
                 format!("First {} rows", self.rows.len()).into()
             }
             QueryState::Cancelled => "Cancelled".into(),
@@ -416,7 +418,15 @@ impl Render for InlineResultView {
                     .into()
                 }
             }
-        };
+        }
+    }
+}
+
+impl Render for InlineResultView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let run = self.run.read(cx);
+        let em_width = window.text_style().font_size.to_pixels(window.rem_size()) * 0.62;
+        let status = self.status(cx);
         let status_color = match &run.state {
             QueryState::Failed(_) => Color::Error,
             _ => Color::Muted,
@@ -487,6 +497,14 @@ pub(crate) fn inline_block_count(editor: EntityId, cx: &App) -> usize {
     cx.try_global::<InlineResults>()
         .and_then(|results| results.0.get(&editor))
         .map_or(0, Vec::len)
+}
+
+#[cfg(test)]
+pub(crate) fn inline_status(editor: EntityId, cx: &App) -> Option<SharedString> {
+    cx.try_global::<InlineResults>()
+        .and_then(|results| results.0.get(&editor))
+        .and_then(|blocks| blocks.last())
+        .map(|block| block._view.read(cx).status(cx))
 }
 
 #[cfg(test)]

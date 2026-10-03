@@ -750,6 +750,16 @@ async fn test_inline_results(cx: &mut TestAppContext) {
     });
     let rows = cx.update(|_, cx| crate::inline::inline_rows(editor_id, cx));
     assert_eq!(rows[0], vec![Some("1".to_string()), Some("n1".to_string())]);
+    // The result says that more rows exist, however the query ended.
+    wait_until(cx, |cx| {
+        cx.update(|_, cx| crate::inline::inline_status(editor_id, cx))
+            .is_some_and(|status| !status.ends_with('…'))
+    });
+    assert_eq!(
+        cx.update(|_, cx| crate::inline::inline_status(editor_id, cx))
+            .as_deref(),
+        Some("First 10 rows")
+    );
     // The result shows below the statement; no tab opens.
     assert!(results(&workspace, cx).is_empty());
 
