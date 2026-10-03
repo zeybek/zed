@@ -133,6 +133,8 @@ Staging and production connections are labeled in the panel and in SQL editors.
 Zed asks for confirmation before running statements that modify data or the schema on a production connection, and warns about `UPDATE` and `DELETE` statements without a `WHERE` clause.
 
 Set `read_only` to `true` to open every session as read-only, so that the database rejects writes.
+This protects against mistakes, but a statement such as `SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE` can turn it off.
+To guarantee that a connection can't write, connect as a database user that only has read access.
 
 ### Project Connections {#project-connections}
 

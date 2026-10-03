@@ -2142,6 +2142,7 @@ pub fn handle_keymap_file_changes(
     let mut old_vim_enabled = VimModeSetting::get_global(cx).0;
     let mut old_helix_enabled = vim_mode_setting::HelixModeSetting::get_global(cx).0;
     let mut old_disable_ai = DisableAiSettings::get_global(cx).disable_ai;
+    let mut old_database_panel_enabled = database_panel::is_enabled(cx);
 
     cx.observe_global::<SettingsStore>(move |cx| {
         let new_base_keymap = *BaseKeymap::get_global(cx);
@@ -2149,7 +2150,11 @@ pub fn handle_keymap_file_changes(
         let new_helix_enabled = vim_mode_setting::HelixModeSetting::get_global(cx).0;
         let new_disable_ai = DisableAiSettings::get_global(cx).disable_ai;
 
-        if new_disable_ai != old_disable_ai {
+        let new_database_panel_enabled = database_panel::is_enabled(cx);
+        if new_disable_ai != old_disable_ai
+            || new_database_panel_enabled != old_database_panel_enabled
+        {
+            old_database_panel_enabled = new_database_panel_enabled;
             reload_menus(cx);
         }
 
