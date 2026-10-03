@@ -380,6 +380,26 @@ async fn test_run_statements_from_sql_editor(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_toggle_focus(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let (_project, window, workspace) = open_workspace(cx).await;
+    let panel = add_panel(window, &workspace, cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    // Activating the panel serializes it while the workspace is being updated.
+    cx.dispatch_action(crate::ToggleFocus);
+    cx.run_until_parked();
+    assert!(cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx)));
+
+    cx.dispatch_action(crate::ToggleFocus);
+    cx.run_until_parked();
+    assert!(!cx.update(|window, cx| panel.focus_handle(cx).contains_focused(window, cx)));
+}
+
+#[gpui::test]
 async fn test_disabling_removes_the_panel(cx: &mut TestAppContext) {
     init_test(cx);
     let directory = tempfile::tempdir().unwrap();

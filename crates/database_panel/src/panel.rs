@@ -26,7 +26,7 @@ use ui::{
     Button, ButtonStyle, Color, ContextMenu, Icon, IconButton, IconName, IconSize, Indicator,
     Label, LabelSize, ListItem, ListItemSpacing, Tooltip, prelude::*,
 };
-use util::{ResultExt as _, TryFutureExt as _};
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -233,27 +233,28 @@ impl DatabasePanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self
-            .workspace
-            .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
         let serialized = SerializedDatabasePanel {
             active: self.active.then_some(true),
             expanded: self.expanded.iter().cloned().collect(),
         };
+        let workspace = self.workspace.clone();
         let kvp = KeyValueStore::global(cx);
-        self.pending_serialization = cx.background_spawn(
+        // The workspace is read later because the panel is also serialized while the workspace
+        // is being updated, such as when the dock activates the panel.
+        self.pending_serialization = cx.spawn(async move |_, cx| {
             async move {
+                let Some(key) = workspace
+                    .read_with(cx, |workspace, _| Self::serialization_key(workspace))?
+                else {
+                    return Ok(());
+                };
                 kvp.write_kvp(key, serde_json::to_string(&serialized)?)
                     .await?;
                 anyhow::Ok(())
             }
-            .log_err(),
-        );
+            .await
+            .log_err()
+        });
     }
 
     fn on_store_event(
