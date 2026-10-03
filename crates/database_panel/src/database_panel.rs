@@ -105,7 +105,11 @@ const ACTION_NAMESPACE: &str = "database_panel";
 pub fn init(cx: &mut App) {
     database_core::init(cx);
 
-    cx.observe_new(|workspace: &mut Workspace, _, _| {
+    cx.observe_new(|workspace: &mut Workspace, _, cx| {
+        // Guests don't see the host's connections, so their own ones would never show either.
+        if workspace.project().read(cx).is_via_collab() {
+            return;
+        }
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
         });

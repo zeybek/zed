@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -13,6 +12,7 @@ use settings::{
     DatabaseConnectionContent, DatabaseEnvironment, DatabaseSshTunnelContent, DatabaseSslMode,
     redact_url_password,
 };
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
 /// The kind of database a connection talks to.
@@ -91,9 +91,14 @@ impl ConnectionKey {
         match &self.project_root {
             None => format!("zed-database:{}", self.id),
             Some(root) => {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                root.hash(&mut hasher);
-                format!("zed-database:{}@{:016x}", self.id, hasher.finish())
+                // The hash must stay the same across Zed versions to find saved passwords.
+                let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+                let hash = digest
+                    .iter()
+                    .take(8)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                format!("zed-database:{}@{hash}", self.id)
             }
         }
     }
@@ -787,6 +792,10 @@ mod tests {
         assert_eq!(user.credentials_key(), "zed-database:local");
         assert_ne!(first.credentials_key(), user.credentials_key());
         assert_ne!(first.credentials_key(), second.credentials_key());
+        assert_eq!(
+            first.credentials_key(),
+            "zed-database:local@6a50dc8584134c7d"
+        );
     }
 
     #[test]

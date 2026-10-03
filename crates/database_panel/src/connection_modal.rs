@@ -236,15 +236,16 @@ impl ConnectionModal {
             }
             _ => {}
         }
+        // The form doesn't show every tunnel option, so the others are kept from the original.
+        let original_ssh = self
+            .original
+            .as_ref()
+            .and_then(|original| original.ssh.as_ref());
         let ssh = Self::field_text(&self.ssh_host, cx).map(|host| SshTunnelConfig {
             host,
-            port: None,
+            port: original_ssh.and_then(|ssh| ssh.port),
             username: Self::field_text(&self.ssh_username, cx),
-            identity_file: self
-                .original
-                .as_ref()
-                .and_then(|original| original.ssh.as_ref())
-                .and_then(|ssh| ssh.identity_file.clone()),
+            identity_file: original_ssh.and_then(|ssh| ssh.identity_file.clone()),
         });
         let network = self.driver.uses_network();
         Ok(ConnectionConfig {
