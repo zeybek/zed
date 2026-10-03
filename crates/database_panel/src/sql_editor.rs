@@ -13,7 +13,6 @@ use gpui::{
 };
 use language::{Buffer, BufferSnapshot, Point};
 use picker::{Picker, PickerDelegate};
-use project::Project;
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Color, Icon, IconButton, IconName, IconSize,
     Label, LabelSize, ListItem, ListItemSpacing, Tooltip, prelude::*,
@@ -125,6 +124,12 @@ pub fn init(cx: &mut App) {
             editor.register_addon(SqlEditorAddon {
                 buffer: buffer.downgrade(),
             });
+            if is_sql_editor(editor, cx)
+                && let Some(root) = editor_worktree_root(editor, cx)
+                && let Some(store) = DbStore::try_global(cx)
+            {
+                store.update(cx, |store, cx| store.load_worktree_connection(root, cx));
+            }
         }
 
         let editor_id = cx.entity_id();
@@ -199,12 +204,19 @@ impl editor::Addon for SqlEditorAddon {
     }
 }
 
-/// The root of the worktree that a project's queries resolve against.
-pub(crate) fn worktree_root(project: &Entity<Project>, cx: &App) -> Option<Arc<Path>> {
-    project
+/// The root of the worktree that an editor's queries resolve against: the worktree of its file,
+/// or the project's first one for untitled buffers.
+pub(crate) fn editor_worktree_root(editor: &Editor, cx: &App) -> Option<Arc<Path>> {
+    let project = editor.project()?.read(cx);
+    let file_worktree = editor
+        .buffer()
         .read(cx)
-        .visible_worktrees(cx)
-        .next()
+        .as_singleton()
+        .and_then(|buffer| buffer.read(cx).file().map(|file| file.worktree_id(cx)))
+        .and_then(|worktree_id| project.worktree_for_id(worktree_id, cx))
+        .filter(|worktree| worktree.read(cx).is_visible());
+    file_worktree
+        .or_else(|| project.visible_worktrees(cx).next())
         .map(|worktree| worktree.read(cx).abs_path())
 }
 
@@ -224,7 +236,7 @@ pub(crate) fn connection_for_editor(editor: &Entity<Editor>, cx: &App) -> Option
     if let Some(config) = store.editor_connection(editor.entity_id()).and_then(find) {
         return Some(config);
     }
-    if let Some(config) = worktree_root(&project, cx)
+    if let Some(config) = editor_worktree_root(editor.read(cx), cx)
         .and_then(|root| store.worktree_connection(&root).cloned())
         .and_then(|key| find(&key))
     {
@@ -586,7 +598,6 @@ impl ConnectionPicker {
                 let delegate = ConnectionPickerDelegate {
                     this,
                     editor,
-                    project,
                     matches: Vec::new(),
                     connections,
                     current,
@@ -620,7 +631,6 @@ impl Render for ConnectionPicker {
 pub struct ConnectionPickerDelegate {
     this: WeakEntity<ConnectionPicker>,
     editor: WeakEntity<Editor>,
-    project: Entity<Project>,
     connections: Vec<ConnectionConfig>,
     matches: Vec<StringMatch>,
     current: Option<ConnectionKey>,
@@ -732,7 +742,7 @@ impl PickerDelegate for ConnectionPickerDelegate {
         };
         let key = connection.key.clone();
         if let Some(editor) = self.editor.upgrade() {
-            let root = worktree_root(&self.project, cx);
+            let root = editor_worktree_root(editor.read(cx), cx);
             let editor_id = editor.entity_id();
             DbStore::global(cx).update(cx, |store, cx| {
                 store.set_editor_connection(editor_id, root, key, cx)
@@ -800,7 +810,9 @@ impl SqlEditorToolbar {
             subscriptions.push(cx.subscribe(&store, |_, _, event: &DbStoreEvent, cx| {
                 if matches!(
                     event,
-                    DbStoreEvent::ConnectionChanged(_) | DbStoreEvent::EditorConnectionChanged(_)
+                    DbStoreEvent::ConnectionChanged(_)
+                        | DbStoreEvent::EditorConnectionChanged(_)
+                        | DbStoreEvent::WorktreeConnectionChanged(_)
                 ) {
                     cx.notify();
                 }

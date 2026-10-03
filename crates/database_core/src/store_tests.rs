@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
-use gpui::{AsyncApp, BorrowAppContext as _, Entity, TestAppContext};
+use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _, Entity, TestAppContext};
 use settings::{DatabaseConnectionContent, SettingsStore};
 
 use crate::{
@@ -672,4 +672,29 @@ fn test_edit_transactions(cx: &mut TestAppContext) {
     });
     let result = wait_for(cx, check).unwrap();
     assert_eq!(result.rows[0][0].as_deref(), Some("3,4,5,10,20"));
+}
+
+#[gpui::test]
+async fn test_worktree_connection_is_remembered(cx: &mut TestAppContext) {
+    let credentials = init_test(cx);
+    let root: Arc<Path> = Path::new("/projects/remembered-connection").into();
+    let connection = ConnectionKey::project("analytics", root.clone());
+    let editor = gpui::EntityId::from(1u64);
+    let store = cx.update(|cx| DbStore::global(cx));
+    store.update(cx, |store, cx| {
+        store.set_editor_connection(editor, Some(root.clone()), connection.clone(), cx)
+    });
+    cx.run_until_parked();
+
+    // A new session starts with nothing in memory and reads the choice back.
+    let restarted = cx.update(|cx| cx.new(|_| DbStore::new(credentials)));
+    restarted.update(cx, |store, cx| {
+        store.load_worktree_connection(root.clone(), cx)
+    });
+    wait_until(cx, |cx| {
+        restarted.read_with(cx, |store, _| store.worktree_connection(&root).is_some())
+    });
+    restarted.read_with(cx, |store, _| {
+        assert_eq!(store.worktree_connection(&root), Some(&connection));
+    });
 }

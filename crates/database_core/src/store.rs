@@ -76,6 +76,8 @@ pub enum DbStoreEvent {
     SchemaChanged(ConnectionKey),
     HistoryChanged(ConnectionKey),
     EditorConnectionChanged(EntityId),
+    /// The connection remembered for a worktree root was loaded or changed.
+    WorktreeConnectionChanged(Arc<Path>),
 }
 
 /// Open sessions of a connection. Metadata queries use their own session, so that browsing the
@@ -887,10 +889,12 @@ impl DbStore {
             };
             let stored: StoredConnectionKey = serde_json::from_str(&stored)?;
             this.update(cx, |this, cx| {
-                this.worktree_connections
-                    .entry(root)
-                    .or_insert_with(|| stored.into());
-                cx.notify();
+                if !this.worktree_connections.contains_key(&root) {
+                    this.worktree_connections
+                        .insert(root.clone(), stored.into());
+                    cx.emit(DbStoreEvent::WorktreeConnectionChanged(root));
+                    cx.notify();
+                }
             })
         })
         .detach_and_log_err(cx);
@@ -907,7 +911,8 @@ impl DbStore {
         match connection {
             Some(connection) => {
                 let stored = StoredConnectionKey::from(&connection);
-                self.worktree_connections.insert(root, connection);
+                self.worktree_connections.insert(root.clone(), connection);
+                cx.emit(DbStoreEvent::WorktreeConnectionChanged(root));
                 cx.background_spawn(async move {
                     kvp.write_kvp(storage_key, serde_json::to_string(&stored)?)
                         .await
@@ -916,6 +921,7 @@ impl DbStore {
             }
             None => {
                 self.worktree_connections.remove(&root);
+                cx.emit(DbStoreEvent::WorktreeConnectionChanged(root.clone()));
                 cx.background_spawn(async move { kvp.delete_kvp(storage_key).await })
                     .detach_and_log_err(cx);
             }

@@ -1135,7 +1135,7 @@ pub(crate) fn open_text_in_editor(
                 let editor =
                     cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
                 if let Some(connection) = connection {
-                    let root = crate::sql_editor::worktree_root(&project, cx);
+                    let root = crate::sql_editor::editor_worktree_root(editor.read(cx), cx);
                     DbStore::global(cx).update(cx, |store, cx| {
                         store.set_editor_connection(editor.entity_id(), root, connection, cx)
                     });

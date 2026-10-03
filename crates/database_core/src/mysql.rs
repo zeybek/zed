@@ -336,7 +336,8 @@ async fn run_statement(
         };
         conn.query_drop("ROLLBACK").await?;
         if !session_read_only {
-            conn.query_drop("SET SESSION TRANSACTION READ WRITE").await?;
+            conn.query_drop("SET SESSION TRANSACTION READ WRITE")
+                .await?;
         }
         return result;
     }

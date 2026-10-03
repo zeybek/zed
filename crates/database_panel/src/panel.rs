@@ -283,7 +283,9 @@ impl DatabasePanel {
                 }
                 self.update_entries(cx);
             }
-            DbStoreEvent::HistoryChanged(_) | DbStoreEvent::EditorConnectionChanged(_) => {}
+            DbStoreEvent::HistoryChanged(_)
+            | DbStoreEvent::EditorConnectionChanged(_)
+            | DbStoreEvent::WorktreeConnectionChanged(_) => {}
         }
     }
 

@@ -203,7 +203,12 @@ async fn test_postgres_session() {
     )
     .await;
     assert!(error.contains("single statement"), "{error}");
-    let error = error_of(session.as_ref(), &format!("DROP TABLE {schema}.orders"), agent).await;
+    let error = error_of(
+        session.as_ref(),
+        &format!("DROP TABLE {schema}.orders"),
+        agent,
+    )
+    .await;
     assert!(error.contains("read-only transaction"), "{error}");
     let events = collect(session.execute(format!("SELECT count(*) FROM {schema}.orders"), agent))
         .await
