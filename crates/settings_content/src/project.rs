@@ -13,8 +13,9 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use util::serde::default_true;
 
 use crate::{
-    AllLanguageSettingsContent, DelayMs, ExtendingVec, ParseStatus, ProjectTerminalSettingsContent,
-    RootUserSettings, SaturatingBool, SplicingVec, fallible_options,
+    AllLanguageSettingsContent, DatabaseConnectionContent, DelayMs, ExtendingVec, ParseStatus,
+    ProjectTerminalSettingsContent, RootUserSettings, SaturatingBool, SplicingVec,
+    fallible_options,
 };
 
 #[with_fallible_options]
@@ -75,6 +76,10 @@ pub struct ProjectSettingsContent {
     /// Default: 60
     pub context_server_timeout: Option<u64>,
 
+    /// Database connections shown in the database panel, by connection id. Connections from
+    /// project settings are only used once the project is trusted.
+    pub database_connections: Option<HashMap<Arc<str>, DatabaseConnectionContent>>,
+
     /// Configuration for how direnv configuration should be loaded
     pub load_direnv: Option<DirenvSettings>,
 
@@ -90,7 +95,7 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        terminal, context_server_timeout, database_connections, load_direnv, git_hosting_providers, disable_ai,
     },
     defaults: { lsp, dap, context_servers },
 });

@@ -217,6 +217,7 @@ impl VsCodeSettings {
             log: None,
             node: self.node_binary_settings(),
 
+            database_panel: None,
             outline_panel: self.outline_panel_settings_content(),
             preview_tabs: self.preview_tabs_settings_content(),
             project: self.project_settings_content(),
@@ -544,6 +545,7 @@ impl VsCodeSettings {
             dap: Default::default(),
             context_servers: self.context_servers(),
             context_server_timeout: None,
+            database_connections: None,
             load_direnv: None,
             git_hosting_providers: None,
             disable_ai: None,

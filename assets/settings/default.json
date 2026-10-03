@@ -1071,6 +1071,25 @@
     // Default width of the collaboration panel.
     "default_width": 240,
   },
+  "database_panel": {
+    // Whether the database panel is available.
+    "enabled": false,
+    // Whether to show the database panel button in the status bar.
+    "button": true,
+    // Where to dock the database panel. Can be 'left' or 'right'.
+    "dock": "right",
+    // Default width of the database panel.
+    "default_width": 320,
+    // How many rows a query fetches before offering to load more. At most 100000.
+    "row_limit": 1000,
+    // How long a statement may run before it is cancelled, in seconds. 0 disables the timeout.
+    "query_timeout_seconds": 0,
+    // How many queries to remember per connection.
+    "history_size": 500,
+    // Whether AI agents can read schemas and run read-only queries through the built-in
+    // database MCP server. Every tool call still asks for permission.
+    "agent_access": false,
+  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,
@@ -2966,6 +2985,16 @@
   "context_server_timeout": 60,
   // Configures context servers for use by the agent.
   "context_servers": {},
+  // Database connections shown in the database panel, by connection id. Passwords are
+  // never stored here: they are requested when connecting and kept in the system keychain.
+  //
+  // For example:
+  // "database_connections": {
+  //   "local": { "driver": "postgres", "host": "localhost", "database": "app_dev", "username": "app" },
+  //   "staging": { "driver": "postgres", "url": "${STAGING_DATABASE_URL}", "environment": "staging" },
+  //   "fixtures": { "driver": "sqlite", "path": "db/dev.sqlite3" }
+  // }
+  "database_connections": {},
   // Configures agent servers available in the agent panel.
   "agent_servers": {},
   "debugger": {
