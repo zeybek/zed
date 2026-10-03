@@ -54,10 +54,17 @@ pub fn init(cx: &mut App) {
     update_registration(cx);
     cx.observe_global::<SettingsStore>(update_registration)
         .detach();
+    // Projects are registered when they're created, because their context server store asks
+    // for the server's command before a workspace opens them.
+    cx.observe_new(|_: &mut Project, _, cx| {
+        let project = cx.entity();
+        register_project(&project, cx);
+    })
+    .detach();
 }
 
 /// Makes a project's connections available to the tools.
-pub fn register_project(project: &Entity<Project>, cx: &mut App) {
+fn register_project(project: &Entity<Project>, cx: &mut App) {
     if let Some(servers) = cx.try_global::<McpServers>()
         && !servers
             .projects

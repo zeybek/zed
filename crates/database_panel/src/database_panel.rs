@@ -106,7 +106,6 @@ pub fn init(cx: &mut App) {
     database_core::init(cx);
 
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
-        database_core::mcp::register_project(workspace.project(), cx);
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<DatabasePanel>(window, cx);
         });

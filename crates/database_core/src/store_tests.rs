@@ -456,7 +456,6 @@ async fn test_mcp_tools_for_agents(cx: &mut TestAppContext) {
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/project", serde_json::json!({})).await;
     let project = Project::test(fs, ["/project".as_ref()], cx).await;
-    cx.update(|cx| crate::mcp::register_project(&project, cx));
 
     let descriptor = cx.update(|cx| {
         ContextServerDescriptorRegistry::default_global(cx)
