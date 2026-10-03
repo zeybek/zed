@@ -12,19 +12,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::{ops::RangeInclusive, sync::Arc};
+
 use gpui::{
-    App, AppContext, Entity, FocusHandle, Focusable, ListAlignment, ListState, Point, Task, Window,
+    App, AppContext, ClipboardItem, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
+    ListState, Point, Task, Window,
 };
 use ui::{
     AbsoluteLength, ResizableColumnsState, SharedString, TableInteractionState,
-    TableResizeBehavior, prelude::*,
+    TableResizeBehavior, prelude::*, table_row::TableRow,
 };
 
 use crate::{
-    MoveFocusedCell, NavigationDirection,
-    settings::TableViewSettings,
-    table_data_engine::{DisplayToDataMapping, TableDataEngine},
-    types::{AnyColumn, DataCellId, DisplayRow, TableLikeContent},
+    ActivateFocusedCell, CopySelection, ExtendSelection, MoveFocusedCell, NavigationDirection,
+    settings::{RowIdentifiers, TableViewSettings, VerticalAlignment},
+    table_data_engine::{DisplayToDataMapping, TableDataEngine, sorting_by_column::AppliedSorting},
+    types::{AnyColumn, DataCellId, DataRow, DisplayRow, TableCell, TableLikeContent},
 };
 
 /// The keyboard cursor: which cell is currently focused for navigation.
@@ -51,6 +54,22 @@ impl CellSelection {
     pub fn is_single_cell(&self) -> bool {
         self.anchor == self.focus
     }
+}
+
+/// Events emitted by [`TableView`] so that embedding views can react to user interaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableViewEvent {
+    SelectionChanged(Option<CellSelection>),
+    /// A cell was double-clicked or activated with the keyboard.
+    CellActivated(DataCellId),
+}
+
+/// Options for embedding a [`TableView`] in a context other than the file preview.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TableViewOptions {
+    pub row_identifiers: RowIdentifiers,
+    pub vertical_alignment: VerticalAlignment,
+    pub multiline_cells: bool,
 }
 
 #[derive(Debug, Default)]
@@ -115,7 +134,11 @@ pub struct TableView {
     pub(crate) is_loading: bool,
     /// The keyboard navigation cursor. `None` until the user first navigates.
     pub(crate) selection: Option<CellSelection>,
+    /// Whether `filter_sort_task` is still computing a mapping for the current contents.
+    pub(crate) mapping_pending: bool,
 }
+
+impl EventEmitter<TableViewEvent> for TableView {}
 
 impl TableView {
     pub fn new(window: &Window, cx: &mut Context<Self>) -> Self {
@@ -146,12 +169,133 @@ impl TableView {
             row_height,
             is_loading: false,
             selection: None,
+            mapping_pending: false,
         }
+    }
+
+    pub fn with_options(mut self, options: TableViewOptions) -> Self {
+        self.settings.numbering_type = options.row_identifiers;
+        self.settings.vertical_alignment = options.vertical_alignment;
+        self.settings.multiline_cells_enabled = options.multiline_cells;
+        self
+    }
+
+    pub fn contents(&self) -> &Arc<TableLikeContent> {
+        &self.engine.contents
+    }
+
+    pub fn cell(&self, cell: DataCellId) -> Option<&TableCell> {
+        self.engine.contents.get_row(cell.row)?.get(cell.col)
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.is_loading
+    }
+
+    pub fn sorting(&self) -> Option<AppliedSorting> {
+        self.engine.applied_sorting
+    }
+
+    pub fn set_sorting(&mut self, sorting: Option<AppliedSorting>, cx: &mut Context<Self>) {
+        self.engine.applied_sorting = sorting;
+        self.apply_filter_sort(cx);
+        cx.notify();
+    }
+
+    /// Clears sorting and filters. Useful when the same columns now hold unrelated data, such as
+    /// a re-executed query.
+    pub fn reset_view_state(&mut self, cx: &mut Context<Self>) {
+        self.engine.reset_view_state();
+        self.apply_filter_sort(cx);
+        cx.notify();
+    }
+
+    pub fn selection(&self) -> Option<CellSelection> {
+        self.selection
+    }
+
+    pub fn set_selection(&mut self, selection: Option<CellSelection>, cx: &mut Context<Self>) {
+        if self.selection != selection {
+            self.selection = selection;
+            cx.emit(TableViewEvent::SelectionChanged(selection));
+            cx.notify();
+        }
+    }
+
+    pub fn data_row(&self, display_row: DisplayRow) -> Option<DataRow> {
+        self.engine.d2d_mapping().get_data_row(display_row)
+    }
+
+    pub fn display_row(&self, data_row: DataRow) -> Option<DisplayRow> {
+        self.engine.d2d_mapping().get_display_row(data_row)
+    }
+
+    /// Number of rows currently shown, after filtering.
+    pub fn visible_row_count(&self) -> usize {
+        self.engine.d2d_mapping().visible_row_count()
+    }
+
+    /// Data rows in display order (after sorting and filtering).
+    pub fn displayed_data_rows(&self) -> impl Iterator<Item = DataRow> + '_ {
+        (0..self.visible_row_count()).filter_map(|row| self.data_row(DisplayRow(row)))
+    }
+
+    /// Appends rows to the end of the current contents, keeping the scroll position.
+    ///
+    /// Unlike [`Self::set_contents`], this doesn't reset filters, the selection or the scroll
+    /// position, which makes it suitable for streaming results in batches.
+    pub fn append_rows(
+        &mut self,
+        rows: Vec<TableRow<TableCell>>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let number_of_cols = self.engine.contents.number_of_cols;
+        if let Some(row) = rows.iter().find(|row| row.cols() != number_of_cols) {
+            anyhow::bail!(
+                "Expected appended rows to have {number_of_cols} columns, got {}",
+                row.cols()
+            );
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let previous_row_digits = digit_count(self.engine.contents.rows.len());
+        let new_rows = self.engine.append_rows(rows);
+
+        if self.mapping_pending || self.engine.has_any_filter_or_sort() {
+            self.apply_filter_sort_preserving_scroll(cx);
+        } else {
+            let old_count = self.list_state.item_count();
+            self.engine.extend_identity_mapping(new_rows.clone());
+            self.list_state
+                .splice(old_count..old_count, new_rows.end - new_rows.start);
+            // Freshly spliced items have no size hint. Re-applying the uniform height gives the
+            // scrollbar a correct total height without measuring every row.
+            self.list_state = self
+                .list_state
+                .clone()
+                .with_uniform_item_height(self.row_height + px(1.0));
+        }
+
+        if digit_count(self.engine.contents.rows.len()) != previous_row_digits {
+            self.sync_column_widths(cx);
+        }
+        cx.notify();
+        Ok(())
     }
 
     /// Replace the data shown by the grid. Recomputes filter menus and column widths, kicks off the
     /// display-to-data recomputation, and clears the loading state.
     pub fn set_contents(&mut self, contents: TableLikeContent, cx: &mut Context<Self>) {
+        let selection_out_of_bounds = self.selection.is_some_and(|selection| {
+            [selection.anchor, selection.focus].iter().any(|cell| {
+                *cell.row >= contents.rows.len() || *cell.col >= contents.number_of_cols
+            })
+        });
+        if selection_out_of_bounds {
+            self.set_selection(None, cx);
+        }
         self.engine.set_contents(contents);
         // The old mapping may reference rows removed by this change. Clear it immediately
         // rather than leaving the list showing stale rows until the background task below
@@ -214,9 +358,18 @@ impl TableView {
     /// Spawns a background task to recompute the display-to-data mapping after a filter or sort
     /// change. Storing the task cancels any previous in-flight computation automatically.
     pub(crate) fn apply_filter_sort(&mut self, cx: &mut Context<Self>) {
+        self.recompute_mapping(false, cx);
+    }
+
+    fn apply_filter_sort_preserving_scroll(&mut self, cx: &mut Context<Self>) {
+        self.recompute_mapping(true, cx);
+    }
+
+    fn recompute_mapping(&mut self, preserve_scroll: bool, cx: &mut Context<Self>) {
         let contents = self.engine.contents.clone();
         let filter_stack = self.engine.filter_stack.clone();
         let sorting = self.engine.applied_sorting;
+        self.mapping_pending = true;
 
         self.filter_sort_task = Some(cx.spawn(async move |this, cx| {
             let mapping = cx
@@ -227,20 +380,20 @@ impl TableView {
 
             this.update(cx, |view, cx| {
                 view.engine.set_d2d_mapping(mapping);
+                view.mapping_pending = false;
                 let visible_rows = view.engine.d2d_mapping().visible_row_count();
+                let scroll_top = view.list_state.logical_scroll_top();
                 // Uses the row height measured on the last render. Cheaper than a full
                 // `.measure_all()` pass; exact row heights are re-measured on scrolling.
                 view.list_state
                     .reset_with_uniform_height(visible_rows, view.row_height + px(1.0));
+                if preserve_scroll && scroll_top.item_ix < visible_rows {
+                    view.list_state.scroll_to(scroll_top);
+                }
                 cx.notify();
             })
             .ok();
         }));
-    }
-
-    #[inline]
-    pub(crate) fn is_selection_enabled(&self) -> bool {
-        cfg!(any(test, debug_assertions))
     }
 
     pub(crate) fn move_focused_cell(
@@ -249,10 +402,6 @@ impl TableView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_selection_enabled() {
-            return;
-        }
-
         let row_count = self.engine.d2d_mapping().visible_row_count();
         let column_count = self.engine.contents.number_of_cols;
 
@@ -276,11 +425,150 @@ impl TableView {
             return;
         };
         let new_cell = DataCellId::new(new_data_row, AnyColumn(new_column));
-        self.selection = Some(CellSelection::single_cell(new_cell));
+        self.set_selection(Some(CellSelection::single_cell(new_cell)), cx);
 
         self.scroll_to_reveal_row(new_row, action.direction);
         self.scroll_to_reveal_column(new_column, window, cx);
         cx.notify();
+    }
+
+    /// Moves the selection focus while keeping its anchor, selecting a rectangle of cells.
+    pub(crate) fn extend_selection(
+        &mut self,
+        action: &ExtendSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row_count = self.engine.d2d_mapping().visible_row_count();
+        let column_count = self.engine.contents.number_of_cols;
+        if row_count == 0 || column_count == 0 {
+            return;
+        }
+
+        let Some(selection) = self.selection else {
+            self.move_focused_cell(
+                &MoveFocusedCell {
+                    direction: action.direction,
+                },
+                window,
+                cx,
+            );
+            return;
+        };
+        let Some(focus_row) = self
+            .engine
+            .d2d_mapping()
+            .get_display_row(selection.focus.row)
+        else {
+            return;
+        };
+
+        let (new_row, new_column) =
+            self.compute_move((*focus_row, *selection.focus.col), action.direction);
+        let Some(new_data_row) = self.engine.d2d_mapping().get_data_row(DisplayRow(new_row)) else {
+            return;
+        };
+        let focus = DataCellId::new(new_data_row, AnyColumn(new_column));
+        self.set_selection(Some(CellSelection::new(selection.anchor, focus)), cx);
+
+        self.scroll_to_reveal_row(new_row, action.direction);
+        self.scroll_to_reveal_column(new_column, window, cx);
+    }
+
+    pub(crate) fn activate_focused_cell(
+        &mut self,
+        _: &ActivateFocusedCell,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(selection) = self.selection {
+            cx.emit(TableViewEvent::CellActivated(selection.focus));
+        }
+    }
+
+    pub(crate) fn select_cell_with_mouse(
+        &mut self,
+        cell: DataCellId,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        let selection = match self.selection {
+            Some(selection) if extend => CellSelection::new(selection.anchor, cell),
+            _ => CellSelection::single_cell(cell),
+        };
+        self.set_selection(Some(selection), cx);
+    }
+
+    /// Display rows and columns covered by the selection, or `None` if its anchor or focus is
+    /// hidden by the current filters.
+    pub fn selection_display_range(
+        &self,
+    ) -> Option<(RangeInclusive<usize>, RangeInclusive<usize>)> {
+        let selection = self.selection?;
+        let mapping = self.engine.d2d_mapping();
+        let focus_row = *mapping.get_display_row(selection.focus.row)?;
+        let anchor_row = mapping
+            .get_display_row(selection.anchor.row)
+            .map_or(focus_row, |row| *row);
+        let rows = anchor_row.min(focus_row)..=anchor_row.max(focus_row);
+        let columns = (*selection.anchor.col).min(*selection.focus.col)
+            ..=(*selection.anchor.col).max(*selection.focus.col);
+        Some((rows, columns))
+    }
+
+    pub(crate) fn is_cell_selected(
+        &self,
+        display_row: DisplayRow,
+        column: AnyColumn,
+        selection_range: Option<&(RangeInclusive<usize>, RangeInclusive<usize>)>,
+    ) -> bool {
+        selection_range.is_some_and(|(rows, columns)| {
+            rows.contains(&display_row.0) && columns.contains(&column.0)
+        })
+    }
+
+    /// The selected cells as tab-separated values, with one line per row. Null cells become empty
+    /// fields; values containing tabs, newlines or quotes are quoted so that spreadsheets read
+    /// them back as a single field.
+    pub fn selection_as_tsv(&self) -> Option<String> {
+        let (rows, columns) = self.selection_display_range()?;
+        let mut output = String::new();
+        for display_row in rows {
+            let Some(data_row) = self.data_row(DisplayRow(display_row)) else {
+                continue;
+            };
+            let Some(row) = self.engine.contents.get_row(data_row) else {
+                continue;
+            };
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            for (index, column) in columns.clone().enumerate() {
+                if index > 0 {
+                    output.push('\t');
+                }
+                if let Some(value) = row
+                    .get(AnyColumn(column))
+                    .and_then(TableCell::display_value)
+                {
+                    output.push_str(&quote_tsv_field(value));
+                }
+            }
+        }
+        Some(output)
+    }
+
+    pub(crate) fn copy_selection(
+        &mut self,
+        _: &CopySelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(text) = self.selection_as_tsv() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
     }
 
     pub(crate) fn scroll_to_reveal_row(&self, row: usize, direction: NavigationDirection) {
@@ -357,6 +645,20 @@ impl TableView {
     }
 }
 
+fn digit_count(value: usize) -> usize {
+    value
+        .checked_ilog10()
+        .map_or(1, |digits| digits as usize + 1)
+}
+
+fn quote_tsv_field(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains(['\t', '\n', '\r', '"']) {
+        format!("\"{}\"", value.replace('"', "\"\"")).into()
+    } else {
+        value.into()
+    }
+}
+
 impl Focusable for TableView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -365,6 +667,8 @@ impl Focusable for TableView {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use gpui::{Action, TestAppContext, VisualTestContext};
 
     use super::*;
@@ -471,5 +775,173 @@ mod tests {
             cx,
         );
         assert_eq!(selection_cells(&view, cx), Some((cell(1, 1), cell(1, 1))));
+    }
+
+    fn generated_row(values: &[Option<&str>]) -> TableRow<TableCell> {
+        let cells = values
+            .iter()
+            .map(|value| match value {
+                Some(value) => TableCell::Generated((*value).to_string().into()),
+                None => TableCell::Null,
+            })
+            .collect::<Vec<_>>();
+        let cols = cells.len();
+        TableRow::from_vec(cells, cols)
+    }
+
+    #[gpui::test]
+    fn test_append_rows_extends_mapping_without_reset(cx: &mut TestAppContext) {
+        let (view, cx) = setup_test_view(cx, 3, 2);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.visible_row_count(), 3);
+            assert_eq!(view.list_state.item_count(), 3);
+            view.append_rows(
+                vec![
+                    generated_row(&[Some("a"), None]),
+                    generated_row(&[Some("b"), Some("c")]),
+                ],
+                cx,
+            )
+            .unwrap();
+            // No filter or sort is active, so the mapping is extended synchronously.
+            assert_eq!(view.visible_row_count(), 5);
+            assert_eq!(view.list_state.item_count(), 5);
+            assert!(
+                view.cell(DataCellId::new(DataRow(3), AnyColumn(1)))
+                    .unwrap()
+                    .is_null()
+            );
+
+            assert!(
+                view.append_rows(vec![generated_row(&[Some("only one column")])], cx)
+                    .is_err()
+            );
+            assert_eq!(view.contents().rows.len(), 5);
+        });
+    }
+
+    #[gpui::test]
+    fn test_append_rows_with_sorting_recomputes_mapping(cx: &mut TestAppContext) {
+        let (view, cx) = setup_test_view(cx, 0, 1);
+        view.update(cx, |view, cx| {
+            let mut contents = TableLikeContent::default();
+            contents.number_of_cols = 1;
+            contents.headers = generated_row(&[Some("n")]);
+            contents.column_kinds = vec![crate::types::ColumnKind::Number];
+            contents.rows = vec![generated_row(&[Some("10")]), generated_row(&[Some("9")])];
+            view.set_contents(contents, cx);
+            view.set_sorting(
+                Some(AppliedSorting {
+                    col_idx: AnyColumn(0),
+                    direction: crate::SortDirection::Asc,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.append_rows(
+                vec![generated_row(&[Some("1")]), generated_row(&[None])],
+                cx,
+            )
+            .unwrap();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let order = view
+                .displayed_data_rows()
+                .map(|row| row.0)
+                .collect::<Vec<_>>();
+            assert_eq!(order, vec![2, 1, 0, 3]);
+            assert_eq!(view.list_state.item_count(), 4);
+        });
+    }
+
+    #[gpui::test]
+    fn test_extend_selection_and_copy_as_tsv(cx: &mut TestAppContext) {
+        let (view, cx) = setup_test_view(cx, 0, 3);
+        view.update(cx, |view, cx| {
+            let mut contents = TableLikeContent::default();
+            contents.number_of_cols = 3;
+            contents.headers = generated_row(&[Some("a"), Some("b"), Some("c")]);
+            contents.rows = vec![
+                generated_row(&[Some("1"), Some("x\ty"), Some("z")]),
+                generated_row(&[Some("2"), None, Some("say \"hi\"")]),
+            ];
+            view.set_contents(contents, cx);
+        });
+        cx.run_until_parked();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&view, move |_, event: &TableViewEvent, _| {
+                events.borrow_mut().push(event.clone());
+            })
+        });
+
+        // The first move places the cursor at the top-left cell, the second moves it right.
+        for _ in 0..2 {
+            dispatch(
+                &view,
+                &MoveFocusedCell {
+                    direction: NavigationDirection::Right,
+                },
+                cx,
+            );
+        }
+        dispatch(
+            &view,
+            &ExtendSelection {
+                direction: NavigationDirection::Down,
+            },
+            cx,
+        );
+        dispatch(
+            &view,
+            &ExtendSelection {
+                direction: NavigationDirection::Right,
+            },
+            cx,
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selection_as_tsv().unwrap(),
+                "\"x\ty\"\tz\n\t\"say \"\"hi\"\"\""
+            );
+        });
+        dispatch(&view, &ActivateFocusedCell, cx);
+        cx.run_until_parked();
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events.last(),
+            Some(&TableViewEvent::CellActivated(DataCellId::new(
+                DataRow(1),
+                AnyColumn(2)
+            )))
+        );
+    }
+
+    #[gpui::test]
+    fn test_set_contents_clears_out_of_bounds_selection(cx: &mut TestAppContext) {
+        let (view, cx) = setup_test_view(cx, 5, 2);
+        view.update(cx, |view, cx| {
+            view.set_selection(
+                Some(CellSelection::single_cell(DataCellId::new(
+                    DataRow(4),
+                    AnyColumn(1),
+                ))),
+                cx,
+            );
+            let mut contents = TableLikeContent::default();
+            contents.number_of_cols = 2;
+            contents.headers = generated_row(&[Some("col_0"), Some("col_1")]);
+            contents.rows = vec![generated_row(&[Some("1"), Some("2")])];
+            view.set_contents(contents, cx);
+            assert_eq!(view.selection(), None);
+        });
     }
 }

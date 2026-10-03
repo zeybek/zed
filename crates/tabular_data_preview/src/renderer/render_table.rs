@@ -1,7 +1,10 @@
 use crate::types::TableCell;
 use gpui::{AnyElement, Entity, Hsla};
 use std::ops::Range;
-use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div, prelude::*};
+use ui::{
+    ColumnWidthConfig, ResizableColumnsState, SharedString, Table, UncheckedTableRow, div,
+    prelude::*,
+};
 
 use crate::{
     TableView,
@@ -50,7 +53,8 @@ impl TableView {
                         table.variable_row_height_list(row_count, self.list_state.clone(), {
                             cx.processor(move |this, display_row: usize, _window, cx| {
                                 this.performance_metrics.rendered_indices.push(display_row);
-                                // The mapping may be transiently stale while a filter/sort task is in-flight. Return an empty row rather than panicking
+                                // The mapping may be transiently stale while a filter/sort task is in-flight.
+                                // `ui::Table` requires exactly `cols` cells per row, so pad with empty cells.
                                 Self::render_single_table_row(
                                     this,
                                     cols,
@@ -59,7 +63,9 @@ impl TableView {
                                     this.row_height,
                                     cx,
                                 )
-                                .unwrap_or_default()
+                                .unwrap_or_else(|| {
+                                    (0..cols).map(|_| div().into_any_element()).collect()
+                                })
                             })
                         })
                     }
@@ -108,13 +114,17 @@ impl TableView {
 
         let mut elements = Vec::with_capacity(cols);
         elements.push(this.create_row_identifier_cell(display_row, data_row, cx)?);
+        let selection_range = this.selection_display_range();
 
         // Remaining columns: actual table data
         for col in (0..this.engine.contents.number_of_cols).map(AnyColumn) {
-            let table_cell = row.expect_get(col);
-
-            // TODO: Introduce `<null>` cell type
-            let cell_content = table_cell.display_value().cloned().unwrap_or_default();
+            let table_cell = row.get(col)?;
+            let is_null = table_cell.is_null();
+            let cell_content = if is_null {
+                SharedString::new_static("NULL")
+            } else {
+                table_cell.display_value().cloned().unwrap_or_default()
+            };
 
             let display_cell_id = DisplayCellId::new(display_row, col);
             let data_cell_id = DataCellId::new(data_row, col);
@@ -126,6 +136,8 @@ impl TableView {
 
             let cell_bg = if is_focus_cell {
                 Some(cx.theme().colors().element_selected)
+            } else if this.is_cell_selected(display_row, col, selection_range.as_ref()) {
+                Some(cx.theme().colors().element_selection_background)
             } else {
                 None
             };
@@ -143,7 +155,9 @@ impl TableView {
                 )
                 .child(TableView::create_selectable_cell(
                     display_cell_id,
+                    data_cell_id,
                     cell_content,
+                    is_null,
                     this.settings.vertical_alignment,
                     cx,
                 ));
@@ -164,6 +178,7 @@ impl TableView {
                                 }
                                 TableCell::Virtual => "Virtual cell".into(),
                                 TableCell::Generated(_) => "Generated cell".into(),
+                                TableCell::Null => "Null cell".into(),
                             },
                         ))
                     })

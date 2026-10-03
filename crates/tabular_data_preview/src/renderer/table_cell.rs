@@ -1,9 +1,15 @@
 //! Table Cell Rendering
 
-use gpui::{AnyElement, ClipboardItem, ElementId, MouseButton, StatefulInteractiveElement};
+use gpui::{
+    AnyElement, ClickEvent, ClipboardItem, ElementId, MouseButton, StatefulInteractiveElement,
+};
 use ui::{Color, Divider, Label, LabelSize, SharedString, Tooltip, div, prelude::*};
 
-use crate::{TableView, settings::VerticalAlignment, types::DisplayCellId};
+use crate::{
+    TableView, TableViewEvent,
+    settings::VerticalAlignment,
+    types::{DataCellId, DisplayCellId},
+};
 
 /// Adds a right-click-to-copy handler and a tooltip showing `text` plus `hint`
 /// (e.g. "Right click to copy content") to a `Stateful` element.
@@ -32,15 +38,31 @@ pub(crate) fn with_copy_on_right_click<E: StatefulInteractiveElement>(
 
 impl TableView {
     /// Create selectable table cell with mouse event handlers.
+    ///
+    /// A click selects the cell, a shift-click extends the selection and a double-click
+    /// activates the cell.
     pub fn create_selectable_cell(
         display_cell_id: DisplayCellId,
+        data_cell_id: DataCellId,
         cell_content: SharedString,
+        is_null: bool,
         vertical_alignment: VerticalAlignment,
         cx: &Context<TableView>,
     ) -> AnyElement {
-        create_table_cell(display_cell_id, cell_content, vertical_alignment, cx)
-            // Mouse events handlers will be here
-            .into_any_element()
+        create_table_cell(
+            display_cell_id,
+            cell_content,
+            is_null,
+            vertical_alignment,
+            cx,
+        )
+        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            this.select_cell_with_mouse(data_cell_id, event.modifiers().shift, window, cx);
+            if event.click_count() >= 2 {
+                cx.emit(TableViewEvent::CellActivated(data_cell_id));
+            }
+        }))
+        .into_any_element()
     }
 }
 
@@ -48,6 +70,7 @@ impl TableView {
 fn create_table_cell(
     display_cell_id: DisplayCellId,
     cell_content: SharedString,
+    is_null: bool,
     vertical_alignment: VerticalAlignment,
     cx: &Context<'_, TableView>,
 ) -> gpui::Stateful<Div> {
@@ -64,7 +87,16 @@ fn create_table_cell(
             VerticalAlignment::Top => div.items_start(),
             VerticalAlignment::Center => div.items_center(),
         })
-        .font_buffer(cx);
-    with_copy_on_right_click(cell, cell_content.clone(), "Right click to copy content")
+        .font_buffer(cx)
+        .when(is_null, |div| {
+            div.italic().text_color(cx.theme().colors().text_muted)
+        });
+    // Copying a NULL yields an empty string, consistent with copying a selection.
+    let copied_text = if is_null {
+        SharedString::default()
+    } else {
+        cell_content.clone()
+    };
+    with_copy_on_right_click(cell, copied_text, "Right click to copy content")
         .child(div().child(cell_content))
 }

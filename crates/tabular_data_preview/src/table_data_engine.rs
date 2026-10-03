@@ -14,7 +14,7 @@ use ui::table_row::TableRow;
 
 use crate::{
     table_data_engine::{
-        filtering_by_column::{FilterEntry, FilterStack, calculate_available_filters, retain_rows},
+        filtering_by_column::{FilterEntry, FilterStack, retain_rows},
         sorting_by_column::{AppliedSorting, sort_data_rows},
     },
     types::{AnyColumn, DataRow, DisplayRow, TableCell, TableLikeContent},
@@ -26,7 +26,9 @@ pub mod sorting_by_column;
 #[derive(Default)]
 pub(crate) struct TableDataEngine {
     pub filter_stack: FilterStack,
-    /// Pre-computed unique values per column, used to populate filter menus
+    /// Unique values per column, used to populate filter menus. Computed lazily per column the
+    /// first time its filter menu is opened, so loading large contents never scans every cell on
+    /// the main thread.
     all_filters: HashMap<AnyColumn, Vec<FilterEntry>>,
     pub applied_sorting: Option<AppliedSorting>,
     d2d_mapping: DisplayToDataMapping,
@@ -55,7 +57,29 @@ impl TableDataEngine {
         // The previous mapping can reference rows removed by an edit. Keep it empty
         // until the background filter/sort task builds a mapping for the new contents.
         self.d2d_mapping = DisplayToDataMapping::default();
-        self.calculate_available_filters();
+        self.all_filters.clear();
+    }
+
+    /// Clears sorting and filters regardless of whether the headers changed.
+    pub(crate) fn reset_view_state(&mut self) {
+        self.filter_stack = FilterStack::default();
+        self.applied_sorting = None;
+    }
+
+    /// Appends rows to the current contents. Returns the range of the new data rows.
+    ///
+    /// Callers must ensure every row has `number_of_cols` cells.
+    pub(crate) fn append_rows(&mut self, rows: Vec<TableRow<TableCell>>) -> std::ops::Range<usize> {
+        let contents = Arc::make_mut(&mut self.contents);
+        let start = contents.rows.len();
+        contents.rows.extend(rows);
+        let end = contents.rows.len();
+        self.all_filters.clear();
+        start..end
+    }
+
+    pub(crate) fn has_any_filter_or_sort(&self) -> bool {
+        self.applied_sorting.is_some() || !self.filter_stack.is_empty()
     }
 
     pub(crate) fn d2d_mapping(&self) -> &DisplayToDataMapping {
@@ -66,11 +90,17 @@ impl TableDataEngine {
         self.d2d_mapping = mapping;
     }
 
-    /// Recomputes the unique filter entries for every column from the current table data.
-    /// Must be called after content changes (e.g. after parsing).
-    pub fn calculate_available_filters(&mut self) {
-        self.all_filters =
-            calculate_available_filters(&self.contents.rows, self.contents.number_of_cols);
+    /// Extends the identity mapping with newly appended rows. Only valid when no sorting or
+    /// filtering is applied and the current mapping is up to date.
+    pub(crate) fn extend_identity_mapping(&mut self, new_rows: std::ops::Range<usize>) {
+        self.d2d_mapping.extend_identity(new_rows);
+    }
+
+    pub(crate) fn cached_filters_for_column(&mut self, column: AnyColumn) -> &Vec<FilterEntry> {
+        let contents = &self.contents;
+        self.all_filters.entry(column).or_insert_with(|| {
+            filtering_by_column::calculate_filter_entries(&contents.rows, column)
+        })
     }
 }
 
@@ -84,8 +114,8 @@ pub struct DisplayToDataMapping {
     pub sorted_rows: Vec<DataRow>,
     /// Rows that survive the active filters. Recomputed every time filters change
     pub retained_rows: HashSet<DataRow>,
-    /// Merged result: sorted rows intersected with retained rows
-    pub mapping: Arc<HashMap<DisplayRow, DataRow>>,
+    /// Merged result: sorted rows intersected with retained rows, indexed by display row.
+    pub mapping: Arc<Vec<DataRow>>,
 }
 
 impl DisplayToDataMapping {
@@ -97,7 +127,7 @@ impl DisplayToDataMapping {
         sorting: Option<AppliedSorting>,
     ) -> Self {
         let mut mapping = Self::default();
-        mapping.apply_sorting(sorting, &contents.rows);
+        mapping.apply_sorting(sorting, contents);
         mapping.apply_filtering(filter_stack, &contents.rows);
         mapping.merge_mappings();
         mapping
@@ -105,20 +135,19 @@ impl DisplayToDataMapping {
 
     /// Get the data row for a given display row
     pub fn get_data_row(&self, display_row: DisplayRow) -> Option<DataRow> {
-        self.mapping.get(&display_row).copied()
+        self.mapping.get(*display_row).copied()
     }
 
     /// Get the display row for a given data row
     pub fn get_display_row(&self, data_row: DataRow) -> Option<DisplayRow> {
+        // Without sorting and filtering, the mapping is the identity.
+        if self.mapping.get(*data_row) == Some(&data_row) {
+            return Some(DisplayRow(*data_row));
+        }
         self.mapping
             .iter()
-            .find_map(|(&display_row, &mapped_data_row)| {
-                if mapped_data_row == data_row {
-                    Some(display_row)
-                } else {
-                    None
-                }
-            })
+            .position(|&mapped_data_row| mapped_data_row == data_row)
+            .map(DisplayRow)
     }
 
     /// Get the number of filtered rows
@@ -126,12 +155,26 @@ impl DisplayToDataMapping {
         self.mapping.len()
     }
 
+    fn extend_identity(&mut self, new_rows: std::ops::Range<usize>) {
+        let mapping = Arc::make_mut(&mut self.mapping);
+        for row in new_rows {
+            self.sorted_rows.push(DataRow(row));
+            self.retained_rows.insert(DataRow(row));
+            mapping.push(DataRow(row));
+        }
+    }
+
     /// Computes sorting
-    fn apply_sorting(&mut self, sorting: Option<AppliedSorting>, rows: &[TableRow<TableCell>]) {
-        let data_rows: Vec<DataRow> = (0..rows.len()).map(DataRow).collect();
+    fn apply_sorting(&mut self, sorting: Option<AppliedSorting>, contents: &TableLikeContent) {
+        let data_rows: Vec<DataRow> = (0..contents.rows.len()).map(DataRow).collect();
 
         let sorted_rows = if let Some(sorting) = sorting {
-            sort_data_rows(&rows, data_rows, sorting)
+            sort_data_rows(
+                &contents.rows,
+                data_rows,
+                sorting,
+                contents.column_kind(sorting.col_idx),
+            )
         } else {
             data_rows
         };
@@ -149,8 +192,7 @@ impl DisplayToDataMapping {
             self.sorted_rows
                 .iter()
                 .filter(|data_row| self.retained_rows.contains(data_row))
-                .enumerate()
-                .map(|(display, data)| (DisplayRow(display), *data))
+                .copied()
                 .collect(),
         );
     }

@@ -45,6 +45,12 @@ pub(crate) struct FilterStack {
     retention_config: HashMap<AnyColumn, HashSet<Option<SharedString>>>,
 }
 
+impl FilterStack {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.retention_config.is_empty()
+    }
+}
+
 impl TableDataEngine {
     pub(crate) fn has_active_filters(&self, col: AnyColumn) -> bool {
         self.filter_stack.retention_config.contains_key(&col)
@@ -57,20 +63,21 @@ impl TableDataEngine {
     /// doesn't block its other values), but a column filtered after `column`
     /// blocks exactly as much as one filtered before it.
     pub(crate) fn get_filters_for_column(
-        &self,
+        &mut self,
         column: AnyColumn,
     ) -> anyhow::Result<Arc<Vec<(FilterEntry, FilterEntryState)>>> {
-        let all_column_entries = self
-            .all_filters
-            .get(&column)
-            .ok_or_else(|| anyhow::anyhow!("Expected {column:?} to have filter entries"))?;
+        anyhow::ensure!(
+            *column < self.contents.number_of_cols,
+            "Expected {column:?} to be within {} columns",
+            self.contents.number_of_cols
+        );
 
-        let empty = HashSet::new();
         let active_column_filters = self
             .filter_stack
             .retention_config
             .get(&column)
-            .unwrap_or(&empty);
+            .cloned()
+            .unwrap_or_default();
 
         // Rows that survive every *other* active column's filter. `column`'s own
         // filter is excluded so its entries reflect what selecting them would
@@ -87,7 +94,7 @@ impl TableDataEngine {
             .find(|&&col| col != column)
             .copied();
 
-        all_column_entries
+        self.cached_filters_for_column(column)
             .iter()
             .map(|entry| {
                 let adjusted_rows: Vec<DataRow> = entry
@@ -187,36 +194,27 @@ impl TableDataEngine {
     }
 }
 
-/// Calculate available filter entries for each column from the table data.
-pub fn calculate_available_filters(
+/// Calculates the unique values of a single column and the rows each value occurs in.
+pub fn calculate_filter_entries(
     content_rows: &[TableRow<TableCell>],
-    number_of_cols: usize,
-) -> HashMap<AnyColumn, Vec<FilterEntry>> {
-    let mut available_filters = HashMap::new();
+    column: AnyColumn,
+) -> Vec<FilterEntry> {
+    let mut value_to_rows: HashMap<Option<SharedString>, Vec<DataRow>> = HashMap::new();
 
-    for col_idx in 0..number_of_cols {
-        let column = AnyColumn::new(col_idx);
-        let mut value_to_rows: HashMap<Option<SharedString>, Vec<DataRow>> = HashMap::new();
-
-        for (row_index, row) in content_rows.iter().enumerate() {
-            let cell_value = row
-                .get(column)
-                .and_then(|cell| cell.display_value().cloned());
-            value_to_rows
-                .entry(cell_value)
-                .or_default()
-                .push(DataRow(row_index));
-        }
-
-        let filter_entries: Vec<FilterEntry> = value_to_rows
-            .into_iter()
-            .map(|(content, rows)| FilterEntry { content, rows })
-            .collect();
-
-        available_filters.insert(column, filter_entries);
+    for (row_index, row) in content_rows.iter().enumerate() {
+        let cell_value = row
+            .get(column)
+            .and_then(|cell| cell.display_value().cloned());
+        value_to_rows
+            .entry(cell_value)
+            .or_default()
+            .push(DataRow(row_index));
     }
 
-    available_filters
+    value_to_rows
+        .into_iter()
+        .map(|(content, rows)| FilterEntry { content, rows })
+        .collect()
 }
 
 /// Returns the set of data rows that survive all active filters in the stack,
@@ -281,7 +279,6 @@ mod tests {
     fn build_engine(table_text: &str) -> TableDataEngine {
         let mut engine = TableDataEngine::default();
         engine.contents = Arc::new(TableLikeContent::from_str(table_text.to_string()));
-        engine.calculate_available_filters();
         engine
     }
 
@@ -290,7 +287,7 @@ mod tests {
     /// deduplicated `(AnyColumn, value)` toggles by reading each column's
     /// entries from an untouched engine and wrapping indices to valid ranges.
     fn resolve_toggles(
-        engine: &TableDataEngine,
+        engine: &mut TableDataEngine,
         cols: usize,
         raw: &[(usize, usize)],
     ) -> Vec<(AnyColumn, Option<SharedString>)> {
@@ -356,7 +353,7 @@ mod tests {
             (cols, table_text) in table_text_strategy(),
             raw_toggles in prop::collection::vec((0usize..3, 0usize..3), 0..8),
         ) {
-            let toggles = resolve_toggles(&build_engine(&table_text), cols, &raw_toggles);
+            let toggles = resolve_toggles(&mut build_engine(&table_text), cols, &raw_toggles);
 
             let mut forward_engine = build_engine(&table_text);
             let forward = apply_and_snapshot(&mut forward_engine, cols, &toggles);

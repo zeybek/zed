@@ -242,6 +242,7 @@ fn from_json_lines(buffer_snapshot: &BufferSnapshot) -> anyhow::Result<TableLike
         rows,
         line_numbers,
         number_of_cols,
+        column_kinds: Vec::new(),
     })
 }
 
@@ -309,6 +310,7 @@ pub fn from_buffer_with_delimiter(
         rows,
         line_numbers: row_line_numbers,
         number_of_cols: max_number_of_cols,
+        column_kinds: Vec::new(),
     }
 }
 

@@ -1778,6 +1778,12 @@
       "down": ["tabular_data::MoveFocusedCell", { "direction": "down" }],
       "left": ["tabular_data::MoveFocusedCell", { "direction": "left" }],
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
+      "shift-up": ["tabular_data::ExtendSelection", { "direction": "up" }],
+      "shift-down": ["tabular_data::ExtendSelection", { "direction": "down" }],
+      "shift-left": ["tabular_data::ExtendSelection", { "direction": "left" }],
+      "shift-right": ["tabular_data::ExtendSelection", { "direction": "right" }],
+      "enter": "tabular_data::ActivateFocusedCell",
+      "cmd-c": "tabular_data::CopySelection",
     },
   },
 ]

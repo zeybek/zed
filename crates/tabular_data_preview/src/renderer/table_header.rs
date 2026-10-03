@@ -226,7 +226,11 @@ impl ColumnFilterDelegate {
     /// toggle changes counts/availability across the cascade) while keeping
     /// `rows`' frozen order, then re-applies the current search query.
     fn refresh_rows(&mut self, cx: &mut Context<Picker<Self>>) {
-        let column_filters = match self.view.read(cx).engine.get_filters_for_column(self.col) {
+        let col = self.col;
+        let column_filters = match self
+            .view
+            .update(cx, |view, _| view.engine.get_filters_for_column(col))
+        {
             Ok(filters) => filters,
             Err(err) => {
                 log::error!("Failed to get filters for column: {err}");
@@ -644,9 +648,7 @@ impl TableView {
                     direction: SortDirection::Asc,
                 }),
             };
-            this.engine.applied_sorting = new_sorting;
-            this.apply_filter_sort(cx);
-            cx.notify();
+            this.set_sorting(new_sorting, cx);
         }))
     }
 
@@ -683,8 +685,9 @@ impl TableView {
         .menu({
             let view_entity = cx.entity();
             move |window, cx| {
-                let view = view_entity.read(cx);
-                let column_filters = match view.engine.get_filters_for_column(col) {
+                let column_filters = match view_entity
+                    .update(cx, |view, _| view.engine.get_filters_for_column(col))
+                {
                     Ok(filters) => filters,
                     Err(err) => {
                         log::error!("Failed to get filters for column: {err}");

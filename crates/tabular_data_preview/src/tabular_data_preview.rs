@@ -8,7 +8,11 @@ use workspace::{Item, Pane, Workspace};
 
 use crate::parser::EditorState;
 
-pub use crate::table_view::{CellSelection, PerformanceMetrics, TableView};
+pub use crate::settings::{RowIdentifiers, VerticalAlignment};
+pub use crate::table_data_engine::sorting_by_column::{AppliedSorting, SortDirection};
+pub use crate::table_view::{
+    CellSelection, PerformanceMetrics, TableView, TableViewEvent, TableViewOptions,
+};
 
 mod parser;
 mod renderer;
@@ -17,7 +21,17 @@ mod table_data_engine;
 mod table_view;
 pub mod types;
 
-actions!(tabular_data, [OpenPreview, OpenPreviewToTheSide]);
+actions!(
+    tabular_data,
+    [
+        OpenPreview,
+        OpenPreviewToTheSide,
+        /// Copies the selected cells as tab-separated values.
+        CopySelection,
+        /// Activates the focused cell, as if it was double-clicked.
+        ActivateFocusedCell,
+    ]
+);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +46,13 @@ pub enum NavigationDirection {
 #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
 #[action(namespace = tabular_data)]
 pub struct MoveFocusedCell {
+    pub direction: NavigationDirection,
+}
+
+/// Extends the cell selection in the given direction, keeping its anchor in place.
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = tabular_data)]
+pub struct ExtendSelection {
     pub direction: NavigationDirection,
 }
 

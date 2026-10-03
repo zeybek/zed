@@ -60,6 +60,12 @@ impl TableView {
 
     /// Calculate width needed for line numbers (can be multi-line)
     fn calculate_line_number_width(&self) -> f32 {
+        // Without source line numbers rows are labelled by their position, so size the column
+        // for the row count instead.
+        if self.engine.contents.line_numbers.is_empty() {
+            return self.calculate_row_number_width();
+        }
+
         // Find the maximum line number that could be displayed
         let max_line_number = self
             .engine

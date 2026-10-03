@@ -8,7 +8,7 @@ pub enum RowRenderMechanism {
     UniformList,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VerticalAlignment {
     /// Align text to the top of cells
     #[default]
@@ -17,7 +17,7 @@ pub enum VerticalAlignment {
     Center,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RowIdentifiers {
     /// Show original line numbers from the source file
     #[default]

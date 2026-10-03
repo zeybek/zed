@@ -24,6 +24,9 @@ pub enum TableCell {
     Generated(SharedString),
     /// Virtual cell, created to pad malformed row
     Virtual,
+    /// An explicit absence of a value reported by a typed source, such as SQL `NULL`.
+    /// Rendered distinctly so it can't be confused with an empty string.
+    Null,
 }
 
 impl TableCell {
@@ -51,7 +54,11 @@ impl TableCell {
         match self {
             TableCell::Real { cached_value, .. } => Some(cached_value),
             TableCell::Generated(value) => Some(value),
-            TableCell::Virtual => None,
+            TableCell::Virtual | TableCell::Null => None,
         }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, TableCell::Null)
     }
 }
