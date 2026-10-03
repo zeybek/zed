@@ -256,6 +256,22 @@ async fn test_panel_tree_and_row_preview(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(results(&workspace, cx).len(), 1);
+
+    // Splitting the tab shows the same rows next to it.
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            let pane = workspace.active_pane().clone();
+            workspace.split_and_clone(pane, workspace::SplitDirection::Right, window, cx)
+        })
+        .await
+        .expect("the result tab can be split");
+    let items = results(&workspace, cx);
+    assert_eq!(items.len(), 2);
+    for item in items {
+        item.read_with(cx, |item, cx| {
+            assert_eq!(item.table().read(cx).contents().rows.len(), 100);
+        });
+    }
 }
 
 #[gpui::test]

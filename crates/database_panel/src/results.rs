@@ -23,7 +23,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    Item, Workspace,
+    Item, Workspace, WorkspaceId,
     item::{ItemEvent, TabContentParams},
 };
 
@@ -1253,6 +1253,42 @@ impl Item for QueryResultsItem {
 
     fn show_toolbar(&self) -> bool {
         false
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    /// The split shows the rows loaded so far, without the running query or pending edits,
+    /// which belong to the original tab. It can be run again on its own.
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<Option<Entity<Self>>> {
+        let contents = TableLikeContent::clone(self.table.read(cx).contents());
+        let sorting = self.table.read(cx).sorting();
+        let split = cx.new(|cx| {
+            let mut split = Self::new(
+                self.workspace.clone(),
+                self.project.clone(),
+                self.config.clone(),
+                ResultOrigin::Other,
+                window,
+                cx,
+            );
+            split.sql = self.sql.clone();
+            split.source = self.source;
+            split.columns = self.columns.clone();
+            split.content = self.content.clone();
+            split.table.update(cx, |table, cx| {
+                table.set_contents(contents, cx);
+                table.set_sorting(sorting, cx);
+            });
+            split
+        });
+        Task::ready(Some(split))
     }
 
     fn is_dirty(&self, _: &App) -> bool {
