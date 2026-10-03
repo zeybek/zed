@@ -97,6 +97,8 @@ Zed never creates a database file that doesn't exist.
 - `verify-full`: also check that the certificate matches the host name.
 
 Set `ssl_root_cert` to a PEM file to trust a private certificate authority, and `ssl_cert` with `ssl_key` to authenticate with a client certificate.
+Without `ssl_root_cert`, PostgreSQL connections in `verify-full` mode trust your system's certificate store, including certificate authorities installed by your organization, and `verify-ca` trusts the Mozilla root certificates bundled with Zed.
+MySQL connections always use the bundled root certificates and `ssl_root_cert`.
 
 ### SSH Tunnels {#ssh-tunnels}
 
