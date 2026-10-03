@@ -760,6 +760,7 @@
       "cmd-shift-m": "diagnostics::Deploy",
       "cmd-shift-e": "project_panel::ToggleFocus",
       "cmd-shift-b": "outline_panel::ToggleFocus",
+      "cmd-k d": "database_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "cmd-shift-d": "debug_panel::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
@@ -1784,6 +1785,36 @@
       "shift-right": ["tabular_data::ExtendSelection", { "direction": "right" }],
       "enter": "tabular_data::ActivateFocusedCell",
       "cmd-c": "tabular_data::CopySelection",
+    },
+  },
+  {
+    "context": "Editor && sql_editor",
+    "bindings": {
+      "cmd-enter": "database_panel::RunQuery",
+      "cmd-shift-enter": "database_panel::RunSelection",
+      "cmd-k x": "database_panel::CancelQuery",
+      "cmd-k c": "database_panel::SelectConnection",
+      "cmd-k h": "database_panel::QueryHistory",
+      "cmd-k l": "database_panel::ExplainQuery",
+    },
+  },
+  {
+    "context": "DatabasePanel && not_editing",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "left": "menu::SelectParent",
+      "right": "menu::SelectChild",
+      "enter": "menu::Confirm",
+      "home": "menu::SelectFirst",
+      "end": "menu::SelectLast",
+      "cmd-c": "database_panel::CopyName",
+    },
+  },
+  {
+    "context": "QueryResults",
+    "bindings": {
+      "cmd-k x": "database_panel::CancelQuery",
     },
   },
 ]
