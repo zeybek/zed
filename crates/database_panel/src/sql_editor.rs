@@ -410,11 +410,15 @@ fn run_embedded(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
 /// Whether text starts with a statement keyword, so that unrelated strings aren't sent to the
 /// database.
 fn looks_like_sql(text: &str) -> bool {
-    !text.trim().is_empty() && statement::classify(text) != statement::StatementKind::Other
-        || text
-            .trim_start()
-            .get(..5)
-            .is_some_and(|start| start.eq_ignore_ascii_case("begin"))
+    matches!(
+        statement::classify(text),
+        statement::StatementKind::Read
+            | statement::StatementKind::Write
+            | statement::StatementKind::Ddl
+    ) || text
+        .trim_start()
+        .get(..5)
+        .is_some_and(|start| start.eq_ignore_ascii_case("begin"))
 }
 
 /// The SQL around `offset` in application code: an injected SQL layer (when the SQL language

@@ -271,11 +271,18 @@ pub enum StatementKind {
     Ddl,
     /// `BEGIN`, `COMMIT`, `SET` and other session statements.
     Other,
+    /// Statements whose effect depends on what they run, such as `EXECUTE`, and statements that
+    /// aren't recognized.
+    Unknown,
 }
 
 impl StatementKind {
-    pub fn modifies_data(self) -> bool {
-        matches!(self, StatementKind::Write | StatementKind::Ddl)
+    /// Whether the statement modifies data or the schema, or might.
+    pub fn may_modify_data(self) -> bool {
+        matches!(
+            self,
+            StatementKind::Write | StatementKind::Ddl | StatementKind::Unknown
+        )
     }
 }
 
@@ -327,8 +334,12 @@ pub fn classify(statement: &str) -> StatementKind {
         "insert" | "update" | "delete" | "merge" | "replace" | "upsert" | "copy" | "call"
         | "do" | "load" => StatementKind::Write,
         "create" | "alter" | "drop" | "truncate" | "rename" | "comment" | "grant" | "revoke"
-        | "reindex" | "vacuum" | "cluster" | "refresh" => StatementKind::Ddl,
-        _ => StatementKind::Other,
+        | "reindex" | "vacuum" | "cluster" | "refresh" | "attach" | "detach" => StatementKind::Ddl,
+        "begin" | "start" | "commit" | "end" | "rollback" | "abort" | "savepoint" | "release"
+        | "set" | "reset" | "use" | "prepare" | "deallocate" | "declare" | "fetch" | "move"
+        | "close" | "lock" | "unlock" | "listen" | "unlisten" | "analyze" | "analyse"
+        | "checkpoint" | "discard" => StatementKind::Other,
+        _ => StatementKind::Unknown,
     }
 }
 
@@ -518,6 +529,11 @@ mod tests {
         );
         assert_eq!(classify("explain select 1"), StatementKind::Read);
         assert_eq!(classify("begin"), StatementKind::Other);
+        assert_eq!(classify("SET search_path = app"), StatementKind::Other);
+        assert_eq!(classify("EXECUTE purge_users"), StatementKind::Unknown);
+        assert!(StatementKind::Unknown.may_modify_data());
+        assert!(!StatementKind::Other.may_modify_data());
+        assert_eq!(classify("ATTACH 'other.db' AS other"), StatementKind::Ddl);
         assert_eq!(classify("select 'delete'"), StatementKind::Read);
     }
 

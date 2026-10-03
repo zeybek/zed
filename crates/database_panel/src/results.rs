@@ -126,7 +126,7 @@ pub(crate) fn confirm_writes(
         .collect::<Vec<_>>();
     let writes = statements
         .iter()
-        .filter(|statement| statement::classify(statement).modifies_data())
+        .filter(|statement| statement::classify(statement).may_modify_data())
         .count();
     if writes == 0 {
         return Task::ready(true);
@@ -135,7 +135,7 @@ pub(crate) fn confirm_writes(
         .iter()
         .any(|statement| statement::is_unfiltered_write(statement));
     let mut detail = format!(
-        "`{}` is a production connection. {} statement{} will modify data or the schema.",
+        "`{}` is a production connection. {} statement{} can modify data or the schema.",
         config.key.id,
         writes,
         if writes == 1 { "" } else { "s" }
