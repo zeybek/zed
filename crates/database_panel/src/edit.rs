@@ -3,7 +3,7 @@
 use gpui::{App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString};
 use ui::{
     Button, ButtonStyle, Label, LabelSize, Modal, ModalFooter, ModalHeader, Section, Switch,
-    ToggleState, prelude::*,
+    SwitchLabelPosition, ToggleState, prelude::*,
 };
 use ui_input::InputField;
 use workspace::ModalView;
@@ -96,6 +96,7 @@ impl Render for EditCellModal {
                                 .child(
                                     Switch::new("set-null", ToggleState::from(self.is_null))
                                         .label("NULL")
+                                        .label_position(SwitchLabelPosition::End)
                                         .on_click(cx.listener(
                                             |this, state: &ToggleState, _, cx| {
                                                 this.is_null = state.selected();

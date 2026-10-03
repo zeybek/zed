@@ -14,7 +14,7 @@ use gpui::{
 use project::Project;
 use ui::{
     Button, ButtonSize, ButtonStyle, Color, Label, LabelSize, Modal, ModalFooter, ModalHeader,
-    Section, Switch, ToggleState, prelude::*,
+    Section, Switch, SwitchLabelPosition, ToggleState, prelude::*,
 };
 use ui_input::InputField;
 use util::ResultExt as _;
@@ -504,6 +504,7 @@ impl Render for ConnectionModal {
             .child(
                 Switch::new("read-only", ToggleState::from(self.read_only))
                     .label("Read-only: the server rejects writes")
+                    .label_position(SwitchLabelPosition::End)
                     .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
                         this.read_only = state.selected();
                         cx.notify();
@@ -718,6 +719,7 @@ impl Render for PasswordModal {
                             v_flex().gap_2().child(self.password.clone()).child(
                                 Switch::new("remember", ToggleState::from(self.remember))
                                     .label("Save in the keychain")
+                                    .label_position(SwitchLabelPosition::End)
                                     .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
                                         this.remember = state.selected();
                                         cx.notify();
