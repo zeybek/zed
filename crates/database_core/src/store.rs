@@ -393,6 +393,68 @@ impl DbStore {
         })
     }
 
+    /// Opens and closes a connection without keeping it, to check its settings. Doesn't store
+    /// the password.
+    pub fn test_connection(
+        &self,
+        config: ConnectionConfig,
+        project: Option<Entity<Project>>,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let password = password.map(|password| PasswordInput {
+            password,
+            remember: false,
+        });
+        cx.spawn(async move |_, cx| {
+            let sessions =
+                open_sessions(&config, project, password, credentials_provider, cx).await?;
+            cx.update(|cx| drop_on_runtime(sessions, cx));
+            Ok(())
+        })
+    }
+
+    /// Saves a connection's password in the keychain.
+    pub fn store_password(
+        &self,
+        key: &ConnectionKey,
+        username: String,
+        password: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let credentials_key = key.credentials_key();
+        cx.spawn(async move |_, cx| {
+            credentials_provider
+                .write_credentials(&credentials_key, &username, password.as_bytes(), cx)
+                .await
+        })
+    }
+
+    /// Moves a stored password to a connection's new key after it was renamed.
+    pub fn move_password(
+        &self,
+        from: &ConnectionKey,
+        to: &ConnectionKey,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let from = from.credentials_key();
+        let to = to.credentials_key();
+        cx.spawn(async move |_, cx| {
+            if let Some((username, password)) =
+                credentials_provider.read_credentials(&from, cx).await?
+            {
+                credentials_provider
+                    .write_credentials(&to, &username, &password, cx)
+                    .await?;
+                credentials_provider.delete_credentials(&from, cx).await?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn has_stored_password(&self, key: &ConnectionKey, cx: &Context<Self>) -> Task<bool> {
         let credentials_provider = self.credentials_provider.clone();
         let credentials_key = key.credentials_key();
