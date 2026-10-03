@@ -200,7 +200,8 @@ With `agent_access` enabled, Zed provides a `zed-database` [MCP server](./ai/mcp
 - `db_schema`: lists schemas and tables, or describes a table.
 - `db_query`: runs one read-only statement and returns up to 200 rows.
 
-Queries run in a read-only transaction that's always rolled back.
+On PostgreSQL and MySQL, queries run in a read-only transaction that's always rolled back.
+On SQLite, statements that would modify the database are rejected.
 The server also provides a `table` prompt to add a table definition to a conversation.
 
 ```json [settings]
