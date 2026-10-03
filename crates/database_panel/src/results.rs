@@ -111,7 +111,7 @@ pub fn run_query(
 }
 
 /// Asks before running statements that write to a production database.
-fn confirm_writes(
+pub(crate) fn confirm_writes(
     config: &ConnectionConfig,
     sql: &str,
     window: &mut Window,

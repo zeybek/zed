@@ -653,3 +653,145 @@ async fn test_edit_cells_and_commit(cx: &mut TestAppContext) {
     let result = output.lock().unwrap().take().unwrap();
     assert_eq!(result.rows[0][0].as_deref(), Some("saved"));
 }
+
+async fn open_file(
+    project: &Entity<Project>,
+    workspace: &Entity<Workspace>,
+    path: &str,
+    cx: &mut VisualTestContext,
+) -> Entity<Editor> {
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path(
+                (worktree_id, util::rel_path::rel_path(path)),
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap()
+}
+
+fn place_cursor(editor: &Entity<Editor>, text: &str, cursor: Point, cx: &mut VisualTestContext) {
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(text, window, cx);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([cursor..cursor])
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+}
+
+#[gpui::test]
+async fn test_inline_results(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let (project, window, workspace) = open_workspace(cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let editor = open_file(&project, &workspace, "query.sql", cx).await;
+    let editor_id = editor.entity_id();
+
+    place_cursor(
+        &editor,
+        "select n, label from numbers order by n;",
+        Point::new(0, 3),
+        cx,
+    );
+    cx.dispatch_action(crate::RunQueryInline);
+    wait_until(cx, |cx| {
+        cx.update(|_, cx| {
+            crate::inline::inline_rows(editor_id, cx).len() == crate::inline::INLINE_ROW_LIMIT
+        })
+    });
+    let rows = cx.update(|_, cx| crate::inline::inline_rows(editor_id, cx));
+    assert_eq!(rows[0], vec![Some("1".to_string()), Some("n1".to_string())]);
+    // The result shows below the statement; no tab opens.
+    assert!(results(&workspace, cx).is_empty());
+
+    // Running it again replaces the result.
+    cx.dispatch_action(crate::RunQueryInline);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| crate::inline::inline_block_count(editor_id, cx)),
+        1
+    );
+
+    // Editing the statement removes its result.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 6)..Point::new(0, 6)])
+        });
+        editor.insert(" n as id,", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| crate::inline::inline_block_count(editor_id, cx)),
+        0
+    );
+}
+
+#[gpui::test]
+async fn test_run_sql_embedded_in_code(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "main.rs": "" }))
+        .await;
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    project.read_with(cx, |project, _| {
+        project.languages().add(language::rust_lang())
+    });
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let editor = open_file(&project, &workspace, "main.rs", cx).await;
+    cx.run_until_parked();
+
+    let code = "fn main() {\n    let query = \"select count(*) from numbers where n > 1000\";\n}\n";
+    place_cursor(&editor, code, Point::new(1, 25), cx);
+    cx.run_until_parked();
+    let range = editor.update(cx, |editor, cx| {
+        let buffer = editor.buffer().read(cx).as_singleton().unwrap();
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = snapshot.point_to_offset(Point::new(1, 25));
+        crate::sql_editor::embedded_sql_range(&snapshot, offset)
+            .map(|range| snapshot.text_for_range(range).collect::<String>())
+    });
+    assert_eq!(
+        range.as_deref(),
+        Some("select count(*) from numbers where n > 1000")
+    );
+
+    cx.dispatch_action(crate::RunEmbeddedQuery);
+    wait_until(cx, |cx| {
+        results(&workspace, cx).first().is_some_and(|item| {
+            item.read_with(cx, |item, cx| {
+                item.run()
+                    .is_some_and(|run| run.read(cx).state == QueryState::Finished)
+            })
+        })
+    });
+    let item = results(&workspace, cx).remove(0);
+    item.read_with(cx, |item, cx| {
+        let contents = item.table().read(cx).contents().clone();
+        assert_eq!(
+            contents.rows[0].as_slice()[0]
+                .display_value()
+                .map(|value| value.as_ref()),
+            Some("500")
+        );
+    });
+}

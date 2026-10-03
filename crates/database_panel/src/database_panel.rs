@@ -5,6 +5,7 @@ mod connection_modal;
 mod edit;
 mod explain;
 mod history;
+mod inline;
 mod panel;
 mod results;
 mod sql_completion;
@@ -52,6 +53,12 @@ gpui::actions!(
         OpenQueryInEditor,
         /// Shows the execution plan of the statement under the cursor.
         ExplainQuery,
+        /// Runs the statement under the cursor and shows its first rows below it.
+        RunQueryInline,
+        /// Removes the results shown below statements in the current editor.
+        ClearInlineResults,
+        /// Runs the SQL in the string under the cursor, in application code.
+        RunEmbeddedQuery,
     ]
 );
 
@@ -114,6 +121,7 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
+    inline::init(cx);
     sql_editor::init(cx);
     history::init(cx);
     results::init(cx);

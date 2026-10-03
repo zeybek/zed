@@ -23,7 +23,8 @@ use workspace::{
 };
 
 use crate::{
-    CancelQuery, ExplainQuery, QueryHistory, RunQuery, RunSelection, SelectConnection,
+    CancelQuery, ClearInlineResults, ExplainQuery, QueryHistory, RunEmbeddedQuery, RunQuery,
+    RunQueryInline, RunSelection, SelectConnection,
     results::{QueryRequest, QueryResultsItem, ResultOrigin, run_query},
 };
 
@@ -40,7 +41,11 @@ pub fn init(cx: &mut App) {
         }
         editor
             .register_action_renderer(|editor, window, cx| {
-                if !crate::is_enabled(cx) || !is_sql_editor(editor, cx) {
+                if !crate::is_enabled(cx)
+                    || editor
+                        .project()
+                        .is_none_or(|project| project.read(cx).is_via_collab())
+                {
                     return;
                 }
                 let editor_handle = cx.entity().downgrade();
@@ -55,6 +60,25 @@ pub fn init(cx: &mut App) {
                             }
                         });
                     };
+                register(
+                    window,
+                    TypeId::of::<ClearInlineResults>(),
+                    |editor, _, cx| {
+                        editor
+                            .update(cx, |editor, cx| crate::inline::clear(editor, cx))
+                            .ok();
+                    },
+                );
+                if !is_sql_editor(editor, cx) {
+                    // In application code, SQL lives in strings.
+                    register(window, TypeId::of::<RunEmbeddedQuery>(), run_embedded);
+                    return;
+                }
+                register(
+                    window,
+                    TypeId::of::<RunQueryInline>(),
+                    |editor, window, cx| run_from_editor(editor, RunScope::Inline, window, cx),
+                );
                 register(window, TypeId::of::<RunQuery>(), |editor, window, cx| {
                     run_from_editor(editor, RunScope::Statement, window, cx)
                 });
@@ -107,6 +131,13 @@ pub fn init(cx: &mut App) {
         cx.on_release(move |_, cx| {
             if let Some(store) = DbStore::try_global(cx) {
                 store.update(cx, |store, _| store.forget_editor(editor_id));
+            }
+            crate::inline::forget_editor(editor_id, cx);
+        })
+        .detach();
+        cx.subscribe_self(|editor, event: &editor::EditorEvent, cx| {
+            if let editor::EditorEvent::BufferEdited = event {
+                crate::inline::invalidate_edited(editor, cx);
             }
         })
         .detach();
@@ -210,6 +241,8 @@ enum RunScope {
     SelectionOrFile,
     /// The execution plan of the selection or the statement under the cursor.
     Explain,
+    /// The selection or statement, with its result shown below it.
+    Inline,
 }
 
 fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Window, cx: &mut App) {
@@ -236,9 +269,15 @@ fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Win
             Some(sql) => sql,
             None => return,
         },
-        RunScope::Statement | RunScope::SelectionOrFile => sql,
+        RunScope::Statement | RunScope::SelectionOrFile | RunScope::Inline => sql,
     };
-    flash(&editor, range, cx);
+    flash(&editor, range.clone(), cx);
+    if scope == RunScope::Inline {
+        if let Some(project) = editor.read(cx).project().cloned() {
+            crate::inline::run_inline(editor, config, project, sql, range, window, cx);
+        }
+        return;
+    }
 
     let Some(workspace) = editor.read(cx).workspace() else {
         return;
@@ -282,6 +321,131 @@ fn explain_statement(driver: DriverKind, sql: &str) -> Option<String> {
     })
 }
 
+/// Runs the SQL in the string literal (or SQL injection) under the cursor of application code,
+/// or the selection.
+fn run_embedded(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
+    let Some(editor) = editor.upgrade() else {
+        return;
+    };
+    let Some(config) = connection_for_editor(&editor, cx) else {
+        ConnectionPicker::toggle(
+            &editor,
+            Some(Box::new(|editor, window, cx| {
+                run_embedded(editor.downgrade(), window, cx)
+            })),
+            window,
+            cx,
+        );
+        return;
+    };
+    let found = editor.update(cx, |editor, cx| {
+        let buffer = editor.buffer().read(cx).as_singleton()?;
+        let snapshot = buffer.read(cx).snapshot();
+        let selection = editor
+            .selections
+            .newest_adjusted(&editor.display_snapshot(cx));
+        let range = if selection.is_empty() {
+            embedded_sql_range(&snapshot, snapshot.point_to_offset(selection.head()))?
+        } else {
+            snapshot.point_to_offset(selection.start)..snapshot.point_to_offset(selection.end)
+        };
+        let sql = snapshot.text_for_range(range.clone()).collect::<String>();
+        Some((
+            sql,
+            snapshot.offset_to_point(range.start)..snapshot.offset_to_point(range.end),
+        ))
+    });
+    let Some((sql, range)) = found.filter(|(sql, _)| looks_like_sql(sql)) else {
+        if let Some(workspace) = editor.read(cx).workspace() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<RunEmbeddedQuery>(),
+                        "No SQL found at the cursor. Place it inside a string with SQL, or select the SQL.",
+                    )
+                    .autohide(),
+                    cx,
+                );
+            });
+        }
+        return;
+    };
+    flash(&editor, range, cx);
+    let (Some(workspace), Some(project)) = (
+        editor.read(cx).workspace(),
+        editor.read(cx).project().cloned(),
+    ) else {
+        return;
+    };
+    let editor_id = editor.entity_id();
+    workspace.update(cx, |workspace, cx| {
+        run_query(
+            workspace,
+            QueryRequest {
+                config,
+                project,
+                sql,
+                origin: ResultOrigin::Editor(editor_id),
+                source: QuerySource::Editor,
+                focus: false,
+            },
+            window,
+            cx,
+        )
+    });
+}
+
+/// Whether text starts with a statement keyword, so that unrelated strings aren't sent to the
+/// database.
+fn looks_like_sql(text: &str) -> bool {
+    !text.trim().is_empty() && statement::classify(text) != statement::StatementKind::Other
+        || text
+            .trim_start()
+            .get(..5)
+            .is_some_and(|start| start.eq_ignore_ascii_case("begin"))
+}
+
+/// The SQL around `offset` in application code: an injected SQL layer (when the SQL language
+/// is installed), or the contents of the string literal under the cursor.
+pub(crate) fn embedded_sql_range(snapshot: &BufferSnapshot, offset: usize) -> Option<Range<usize>> {
+    if let Some(layer) = snapshot.syntax_layer_at(offset)
+        && layer.language.name().as_ref().eq_ignore_ascii_case("sql")
+    {
+        return Some(layer.node().byte_range());
+    }
+    let mut node = snapshot.syntax_ancestor(offset..offset)?;
+    loop {
+        let kind = node.kind();
+        if kind.contains("string") && !kind.contains("content") && !kind.contains("fragment") {
+            let range = node.byte_range();
+            let text = snapshot.text_for_range(range.clone()).collect::<String>();
+            let (start, end) = string_contents(&text)?;
+            return Some(range.start + start..range.start + end);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// The byte range of a string literal's contents, without prefixes and quotes, such as for
+/// `"…"`, `'…'`, `"""…"""`, `` `…` ``, `r#"…"#` and `f"…"`.
+fn string_contents(literal: &str) -> Option<(usize, usize)> {
+    let prefix_len = literal.find(['"', '\'', '`'])?;
+    let quote = literal[prefix_len..].chars().next()?;
+    let hashes = literal[..prefix_len]
+        .chars()
+        .rev()
+        .take_while(|c| *c == '#')
+        .count();
+    let opening = if literal[prefix_len..].starts_with(&quote.to_string().repeat(3)) {
+        3
+    } else {
+        1
+    };
+    let start = prefix_len + opening;
+    let end = literal.len().checked_sub(opening + hashes)?;
+    (start <= end).then_some((start, end))
+}
+
 fn cancel_from_editor(editor: WeakEntity<Editor>, _window: &mut Window, cx: &mut App) {
     let Some(editor) = editor.upgrade() else {
         return;
@@ -322,7 +486,7 @@ fn sql_to_run(
             let text = snapshot.text();
             (!text.trim().is_empty()).then(|| (text, Point::zero()..snapshot.max_point()))
         }
-        RunScope::Statement | RunScope::Explain => {
+        RunScope::Statement | RunScope::Explain | RunScope::Inline => {
             let cursor = snapshot.point_to_offset(selection.head());
             let range = statement_range(&snapshot, cursor)?;
             let text = snapshot.text_for_range(range.clone()).collect::<String>();
@@ -798,6 +962,25 @@ fn is_editor_query_running(workspace: &Entity<Workspace>, editor_id: EntityId, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_string_contents() {
+        fn contents(literal: &str) -> Option<&str> {
+            string_contents(literal).map(|(start, end)| &literal[start..end])
+        }
+        assert_eq!(contents("\"select 1\""), Some("select 1"));
+        assert_eq!(contents("'select 1'"), Some("select 1"));
+        assert_eq!(contents("`select ${x}`"), Some("select ${x}"));
+        assert_eq!(contents("f\"select {x}\""), Some("select {x}"));
+        assert_eq!(
+            contents("\"\"\"\n  select 1\n\"\"\""),
+            Some("\n  select 1\n")
+        );
+        assert_eq!(contents("r#\"select \"x\"\"#"), Some("select \"x\""));
+        assert!(looks_like_sql(" SELECT * FROM t"));
+        assert!(looks_like_sql("with x as (select 1) select * from x"));
+        assert!(!looks_like_sql("hello world"));
+    }
 
     #[test]
     fn test_explain_statement() {
