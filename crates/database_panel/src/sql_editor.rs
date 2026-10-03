@@ -296,12 +296,12 @@ fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Win
     let Some((sql, range)) = editor.update(cx, |editor, cx| sql_to_run(editor, scope, cx)) else {
         return;
     };
-    let sql = match scope {
+    let explain_sql = match scope {
         RunScope::Explain => match explain_statement(config.driver, &sql) {
-            Some(sql) => sql,
+            Some(explain_sql) => Some(explain_sql),
             None => return,
         },
-        RunScope::Statement | RunScope::SelectionOrFile | RunScope::Inline => sql,
+        RunScope::Statement | RunScope::SelectionOrFile | RunScope::Inline => None,
     };
     flash(&editor, range.clone(), cx);
     if scope == RunScope::Inline {
@@ -320,8 +320,8 @@ fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Win
     let editor_id = editor.entity_id();
     let statement = StatementLocation::new(&editor, range, cx);
     workspace.update(cx, |workspace, cx| {
-        if scope == RunScope::Explain {
-            crate::explain::show_explain(config, project, sql, window, cx);
+        if let Some(explain_sql) = explain_sql {
+            crate::explain::show_explain(config, project, explain_sql, &sql, window, cx);
             return;
         }
         run_query(

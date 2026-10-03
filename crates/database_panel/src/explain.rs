@@ -29,11 +29,12 @@ pub struct PlanNode {
     pub detail: String,
 }
 
-/// Runs `EXPLAIN` for `sql` and opens its plan next to the active pane.
+/// Runs `explain_sql`, the `EXPLAIN` of `statement`, and opens its plan next to the active pane.
 pub fn show_explain(
     config: ConnectionConfig,
     project: gpui::Entity<Project>,
-    sql: String,
+    explain_sql: String,
+    statement: &str,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
@@ -44,6 +45,7 @@ pub fn show_explain(
         window,
         cx,
     );
+    let title: SharedString = statement::summary(statement, 32).into();
     let task = cx.spawn_in(window, async move |workspace, cx| {
         connect.await?;
         // EXPLAIN without ANALYZE doesn't run the statement; the read-only transaction makes sure
@@ -54,7 +56,7 @@ pub fn show_explain(
                     store.execute_for_agent(
                         config.clone(),
                         Some(project.clone()),
-                        sql.clone(),
+                        explain_sql.clone(),
                         10_000,
                         4_000_000,
                         cx,
@@ -68,11 +70,7 @@ pub fn show_explain(
             let item = cx.new(|cx| ExplainItem {
                 workspace: workspace_handle,
                 project,
-                title: statement::summary(
-                    sql.trim_start_matches(|c: char| !c.is_whitespace()).trim(),
-                    32,
-                )
-                .into(),
+                title,
                 nodes,
                 raw,
                 focus_handle: cx.focus_handle(),
