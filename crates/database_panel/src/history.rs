@@ -8,11 +8,12 @@ use database_core::{
 use editor::Editor;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
+    Action as _, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
+    Task, WeakEntity,
 };
 use picker::{Picker, PickerDelegate};
 use project::Project;
-use ui::{Color, Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
+use ui::{Color, KeyBinding, Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use crate::results::{QueryRequest, ResultOrigin, open_text_in_editor, run_query};
@@ -68,7 +69,8 @@ impl HistoryPicker {
                 matches: Vec::new(),
                 selected_index: 0,
             };
-            let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
+            let picker =
+                cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(40.)));
             let subscription = cx.subscribe_in(&store, window, {
                 let picker = picker.clone();
                 move |_, _, event: &DbStoreEvent, window, cx| {
@@ -97,7 +99,7 @@ impl Focusable for HistoryPicker {
 
 impl Render for HistoryPicker {
     fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(40.)).child(self.picker.clone())
+        v_flex().child(self.picker.clone())
     }
 }
 
@@ -268,7 +270,7 @@ impl PickerDelegate for HistoryPickerDelegate {
         index: usize,
         selected: bool,
         _window: &mut Window,
-        _cx: &mut gpui::Context<Picker<Self>>,
+        cx: &mut gpui::Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let candidate = self.matches.get(index)?;
         let entry = self.entries.get(candidate.candidate_id)?;
@@ -287,7 +289,7 @@ impl PickerDelegate for HistoryPickerDelegate {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .font_buffer(_cx)
+                                .font_buffer(cx)
                                 .child(statement::summary(&entry.sql, 120)),
                         )
                         .child(
@@ -302,22 +304,26 @@ impl PickerDelegate for HistoryPickerDelegate {
     fn render_footer(
         &self,
         _window: &mut Window,
-        _cx: &mut gpui::Context<Picker<Self>>,
+        cx: &mut gpui::Context<Picker<Self>>,
     ) -> Option<gpui::AnyElement> {
         Some(
             h_flex()
                 .p_2()
-                .gap_3()
+                .gap_1()
                 .justify_end()
                 .child(
-                    Label::new("Enter: run again")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Button::new("copy-to-editor", "Copy to Editor")
+                        .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
+                        }),
                 )
                 .child(
-                    Label::new("Secondary enter: copy to editor")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Button::new("run-again", "Run Again")
+                        .key_binding(KeyBinding::for_action(&menu::Confirm, cx))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                        }),
                 )
                 .into_any_element(),
         )

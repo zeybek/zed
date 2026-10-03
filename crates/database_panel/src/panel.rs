@@ -1237,11 +1237,12 @@ impl DatabasePanel {
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child(
-                    Label::new("Install the SQL extension for highlighting and completions.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div().flex_1().min_w_0().child(
+                        Label::new("Install the SQL extension for highlighting and completions.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
                 )
-                .child(div().flex_1())
                 .child(
                     Button::new("install-sql", "Install")
                         .style(ButtonStyle::Subtle)

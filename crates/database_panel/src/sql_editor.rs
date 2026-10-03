@@ -633,7 +633,9 @@ impl ConnectionPicker {
                     on_select,
                 };
                 Self {
-                    picker: cx.new(|cx| Picker::uniform_list(delegate, window, cx)),
+                    picker: cx.new(|cx| {
+                        Picker::uniform_list(delegate, window, cx).initial_width(rems(36.))
+                    }),
                 }
             });
         });
@@ -652,7 +654,7 @@ impl Focusable for ConnectionPicker {
 
 impl Render for ConnectionPicker {
     fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(30.)).child(self.picker.clone())
+        v_flex().child(self.picker.clone())
     }
 }
 
@@ -806,16 +808,16 @@ impl PickerDelegate for ConnectionPickerDelegate {
                 .child(
                     h_flex()
                         .gap_2()
+                        .w_full()
                         .child(Label::new(connection.key.id.clone()))
                         .child(
-                            Label::new(connection.display_target())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
-                .end_slot(
-                    h_flex()
-                        .gap_1()
+                            div().flex_1().min_w_0().overflow_hidden().child(
+                                Label::new(connection.display_target())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                        )
                         .child(crate::panel::environment_label(connection))
                         .when(is_current, |row| {
                             row.child(Icon::new(IconName::Check).size(IconSize::Small))
