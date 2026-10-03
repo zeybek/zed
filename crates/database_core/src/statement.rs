@@ -380,6 +380,57 @@ pub fn summary(statement: &str, max_chars: usize) -> String {
     summary
 }
 
+/// A value as an SQL literal: a quoted string, or `NULL`. Strings are compared and assigned
+/// through the database's implicit casts, which accept the text form of every value shown in
+/// results.
+pub fn literal(driver: crate::DriverKind, value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "NULL".to_string();
+    };
+    let mut escaped = value.replace('\'', "''");
+    if driver == crate::DriverKind::Mysql {
+        // MySQL treats backslashes in strings as escapes by default.
+        escaped = escaped.replace('\\', "\\\\");
+    }
+    format!("'{escaped}'")
+}
+
+/// An `UPDATE` of one row, identified by its primary key values.
+pub fn update_statement(
+    driver: crate::DriverKind,
+    schema: &str,
+    relation: &str,
+    assignments: &[(&str, Option<&str>)],
+    key: &[(&str, Option<&str>)],
+) -> String {
+    let set = assignments
+        .iter()
+        .map(|(column, value)| {
+            format!(
+                "{} = {}",
+                crate::driver::quote_identifier(driver, column),
+                literal(driver, *value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let condition = key
+        .iter()
+        .map(|(column, value)| {
+            let column = crate::driver::quote_identifier(driver, column);
+            match value {
+                Some(value) => format!("{column} = {}", literal(driver, Some(value))),
+                None => format!("{column} IS NULL"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "UPDATE {} SET {set} WHERE {condition}",
+        crate::driver::qualified_name(driver, schema, relation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +529,41 @@ mod tests {
         assert!(!is_unfiltered_write("select * from users"));
         assert!(!is_unfiltered_write("delete from t where x = 'where'"));
         assert!(is_unfiltered_write("delete from t -- where id = 1"));
+    }
+
+    #[test]
+    fn test_update_statement() {
+        use crate::DriverKind;
+        assert_eq!(
+            update_statement(
+                DriverKind::Postgres,
+                "public",
+                "users",
+                &[("name", Some("O'Brien")), ("note", None)],
+                &[("id", Some("7"))]
+            ),
+            "UPDATE public.users SET name = 'O''Brien', note = NULL WHERE id = '7'"
+        );
+        assert_eq!(
+            update_statement(
+                DriverKind::Mysql,
+                "app",
+                "order",
+                &[("path", Some("C:\\tmp"))],
+                &[("a", Some("1")), ("b", None)]
+            ),
+            "UPDATE app.`order` SET path = 'C:\\\\tmp' WHERE a = '1' AND b IS NULL"
+        );
+        assert_eq!(
+            update_statement(
+                DriverKind::Sqlite,
+                "main",
+                "t",
+                &[("x", Some("1"))],
+                &[("id", Some("2"))]
+            ),
+            "UPDATE t SET x = '1' WHERE id = '2'"
+        );
     }
 
     #[test]

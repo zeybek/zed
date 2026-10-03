@@ -604,3 +604,73 @@ async fn test_mcp_tools_for_agents(cx: &mut TestAppContext) {
             .is_none()
     }));
 }
+
+#[gpui::test]
+fn test_edit_transactions(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("numbers.sqlite3");
+    create_database(&path, 5);
+    let config = sqlite_config("edits", &path);
+    let store = cx.update(|cx| DbStore::global(cx));
+    let update = |n: &str, value: &str| {
+        crate::statement::update_statement(
+            crate::DriverKind::Sqlite,
+            "main",
+            "numbers",
+            &[("n", Some(value))],
+            &[("n", Some(n))],
+        )
+    };
+
+    let task = store.update(cx, |store, cx| {
+        store.execute_transaction(
+            config.clone(),
+            None,
+            vec![update("1", "10"), update("2", "20")],
+            cx,
+        )
+    });
+    wait_for(cx, task).unwrap();
+
+    // The second statement matches no row, so the first one is rolled back too.
+    let task = store.update(cx, |store, cx| {
+        store.execute_transaction(
+            config.clone(),
+            None,
+            vec![update("3", "30"), update("99", "1")],
+            cx,
+        )
+    });
+    let error = wait_for(cx, task).unwrap_err();
+    assert!(error.to_string().contains("changed 0"), "{error}");
+
+    let run = store.update(cx, |store, cx| {
+        store.execute(
+            config.clone(),
+            None,
+            "SELECT n FROM numbers ORDER BY n".into(),
+            QuerySource::Editor,
+            cx,
+        )
+    });
+    let rows = received_rows(&run, cx);
+    wait_until(cx, |cx| {
+        run.read_with(cx, |run, _| run.state == QueryState::Finished)
+    });
+    assert_eq!(*rows.lock().unwrap(), 5);
+    let values = run.read_with(cx, |run, _| run.row_count);
+    assert_eq!(values, 5);
+    let check = store.update(cx, |store, cx| {
+        store.execute_for_agent(
+            config.clone(),
+            None,
+            "SELECT group_concat(n, ',') FROM (SELECT n FROM numbers ORDER BY n)".into(),
+            10,
+            1000,
+            cx,
+        )
+    });
+    let result = wait_for(cx, check).unwrap();
+    assert_eq!(result.rows[0][0].as_deref(), Some("3,4,5,10,20"));
+}

@@ -758,6 +758,44 @@ impl DbStore {
         })
     }
 
+    /// Runs statements in one transaction on the connection's main session. Each statement
+    /// must change exactly one row; otherwise everything is rolled back, so that edits based on
+    /// stale results never apply partially.
+    pub fn execute_transaction(
+        &mut self,
+        config: ConnectionConfig,
+        project: Option<Entity<Project>>,
+        statements: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let connect = self.ensure_connected(config.clone(), project, cx);
+        let key = config.key.clone();
+        // A result paused at its row limit holds the session.
+        if let Some(state) = self.states.get(&key) {
+            for run in &state.active_runs {
+                run.update(cx, |run, cx| run.release_session(cx)).ok();
+            }
+        }
+        let driver = config.driver;
+        cx.spawn(async move |_, cx| {
+            let sessions = connect.await?;
+            let session = sessions.main.clone();
+            let sanitize = sessions.sanitize.clone();
+            let result = gpui_tokio::Tokio::spawn_result(cx, async move {
+                run_transaction(session, driver, statements)
+                    .await
+                    .map_err(|error| anyhow!(sanitize(&format!("{error:#}"))))
+            })
+            .await;
+            telemetry::event!(
+                "Database Rows Edited",
+                driver = driver.id(),
+                outcome = if result.is_ok() { "ok" } else { "error" }
+            );
+            result
+        })
+    }
+
     pub fn history(&self, key: &ConnectionKey) -> impl Iterator<Item = &HistoryEntry> {
         self.history.entries(key)
     }
@@ -1232,6 +1270,54 @@ async fn collect_result(
         }
     }
     Ok(result)
+}
+
+/// Runs a statement to completion and returns the number of rows it changed.
+async fn run_to_completion(session: &Arc<dyn DatabaseSession>, sql: String) -> Result<Option<u64>> {
+    let mut stream = session.execute(sql, ExecOptions::default());
+    let mut rows_affected = None;
+    while let Some(event) = stream.next().await {
+        if let ResultEvent::StatementComplete {
+            rows_affected: Some(rows),
+        } = event?
+        {
+            rows_affected = Some(rows);
+        }
+    }
+    Ok(rows_affected)
+}
+
+async fn run_transaction(
+    session: Arc<dyn DatabaseSession>,
+    driver: DriverKind,
+    statements: Vec<String>,
+) -> Result<()> {
+    let begin = match driver {
+        DriverKind::Mysql => "START TRANSACTION",
+        DriverKind::Postgres | DriverKind::Sqlite => "BEGIN",
+    };
+    run_to_completion(&session, begin.into()).await?;
+    let result = async {
+        for statement in statements {
+            let rows = run_to_completion(&session, statement.clone()).await?;
+            if rows != Some(1) {
+                anyhow::bail!(
+                    "expected `{}` to change one row, but it changed {}; the row may have been modified or deleted since it was loaded",
+                    crate::statement::summary(&statement, 80),
+                    rows.unwrap_or(0)
+                );
+            }
+        }
+        run_to_completion(&session, "COMMIT".into()).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if result.is_err() {
+        run_to_completion(&session, "ROLLBACK".into())
+            .await
+            .log_err();
+    }
+    result
 }
 
 fn row_chars(row: &ResultRow) -> usize {

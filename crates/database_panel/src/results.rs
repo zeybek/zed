@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
 use database_core::{
@@ -14,13 +14,14 @@ use gpui::{
 };
 use project::Project;
 use tabular_data_preview::{
-    TableView, TableViewOptions,
-    types::{ColumnKind, TableCell, TableLikeContent},
+    TableView, TableViewEvent, TableViewOptions,
+    types::{AnyColumn, ColumnKind, DataCellId, DataRow, TableCell, TableLikeContent},
 };
 use ui::{
     Button, ButtonSize, Color, ContextMenu, Icon, IconButton, IconName, IconSize, Label, LabelSize,
     PopoverMenu, SpinnerLabel, Tooltip, prelude::*, table_row::TableRow,
 };
+use util::ResultExt as _;
 use workspace::{
     Item, Workspace,
     item::{ItemEvent, TabContentParams},
@@ -219,6 +220,23 @@ fn show_result(
     });
 }
 
+/// Cell edits of a result that shows a table with a primary key.
+struct EditState {
+    schema: SharedString,
+    relation: SharedString,
+    /// Result columns that hold the primary key.
+    key_columns: Vec<usize>,
+    /// Changed cells by (data row, column), with their value before the first change.
+    pending: BTreeMap<(usize, usize), PendingEdit>,
+    error: Option<SharedString>,
+    committing: Option<Task<()>>,
+}
+
+struct PendingEdit {
+    original: TableCell,
+    value: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Content {
     Empty,
@@ -239,8 +257,9 @@ pub struct QueryResultsItem {
     columns: Vec<ColumnMeta>,
     content: Content,
     focus_handle: FocusHandle,
+    edits: Option<EditState>,
     _run_subscription: Option<Subscription>,
-    _table_subscription: Subscription,
+    _table_subscriptions: [Subscription; 2],
 }
 
 impl EventEmitter<ItemEvent> for QueryResultsItem {}
@@ -260,7 +279,10 @@ impl QueryResultsItem {
                 ..Default::default()
             })
         });
-        let table_subscription = cx.observe(&table, |_, _, cx| cx.notify());
+        let table_subscriptions = [
+            cx.observe(&table, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&table, window, Self::on_table_event),
+        ];
         Self {
             workspace,
             project,
@@ -273,8 +295,9 @@ impl QueryResultsItem {
             columns: Vec::new(),
             content: Content::Empty,
             focus_handle: cx.focus_handle(),
+            edits: None,
             _run_subscription: None,
-            _table_subscription: table_subscription,
+            _table_subscriptions: table_subscriptions,
         }
     }
 
@@ -316,7 +339,9 @@ impl QueryResultsItem {
         self.source = source;
         self.columns.clear();
         self.content = Content::Empty;
+        self.edits = None;
         self.table.update(cx, |table, cx| {
+            table.set_marked_cells([], cx);
             table.set_contents(TableLikeContent::default(), cx);
             table.reset_view_state(cx);
             table.set_loading(true, cx);
@@ -348,6 +373,7 @@ impl QueryResultsItem {
                     table.set_contents(contents, cx);
                     table.reset_view_state(cx);
                 });
+                self.detect_editability(cx);
             }
             QueryRunEvent::Rows(rows) => {
                 let cols = self.columns.len();
@@ -385,6 +411,306 @@ impl QueryResultsItem {
             }
         }
         cx.notify();
+    }
+
+    /// Results of browsing a table can be edited when they include its primary key.
+    fn detect_editability(&mut self, cx: &mut gpui::Context<Self>) {
+        let ResultOrigin::Relation {
+            connection,
+            schema,
+            relation,
+        } = &self.origin
+        else {
+            return;
+        };
+        if self.config.read_only || connection != &self.config.key {
+            return;
+        }
+        let (schema, relation) = (schema.clone(), relation.clone());
+        let store = DbStore::global(cx);
+        let load = store.update(cx, |store, cx| {
+            if store
+                .columns(&self.config.key, &schema, &relation)
+                .is_some()
+            {
+                Task::ready(Ok(()))
+            } else {
+                store.load_columns(
+                    self.config.clone(),
+                    Some(self.project.clone()),
+                    schema.clone(),
+                    relation.clone(),
+                    cx,
+                )
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            load.await?;
+            this.update(cx, |this, cx| {
+                let Some(columns) = DbStore::global(cx)
+                    .read(cx)
+                    .columns(&this.config.key, &schema, &relation)
+                    .map(<[_]>::to_vec)
+                else {
+                    return;
+                };
+                let key_columns = columns
+                    .iter()
+                    .filter(|column| column.primary_key)
+                    .map(|column| {
+                        this.columns
+                            .iter()
+                            .position(|result_column| result_column.name == column.name)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default();
+                if !key_columns.is_empty() {
+                    this.edits = Some(EditState {
+                        schema,
+                        relation,
+                        key_columns,
+                        pending: BTreeMap::new(),
+                        error: None,
+                        committing: None,
+                    });
+                    cx.notify();
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    pub fn is_editable(&self) -> bool {
+        self.edits.is_some()
+    }
+
+    pub fn pending_edit_count(&self) -> usize {
+        self.edits.as_ref().map_or(0, |edits| edits.pending.len())
+    }
+
+    fn on_table_event(
+        &mut self,
+        _: &Entity<TableView>,
+        event: &TableViewEvent,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let TableViewEvent::CellActivated(cell) = event else {
+            return;
+        };
+        if self.edits.is_none() {
+            return;
+        }
+        let Some(column) = self.columns.get(*cell.col).cloned() else {
+            return;
+        };
+        let value = self
+            .table
+            .read(cx)
+            .cell(*cell)
+            .and_then(|cell| cell.display_value().cloned());
+        if column.kind == ValueKind::Binary {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let cell = *cell;
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    crate::edit::EditCellModal::new(
+                        column.name.clone(),
+                        column.type_name.clone(),
+                        value,
+                        Box::new(move |value, _, cx| {
+                            this.update(cx, |this, cx| this.apply_edit(cell, value, cx))
+                                .ok();
+                        }),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .ok();
+    }
+
+    pub(crate) fn apply_edit(
+        &mut self,
+        cell: DataCellId,
+        value: Option<String>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(edits) = self.edits.as_mut() else {
+            return;
+        };
+        let Some(current) = self.table.read(cx).cell(cell).cloned() else {
+            return;
+        };
+        let key = (*cell.row, *cell.col);
+        let original = edits
+            .pending
+            .remove(&key)
+            .map_or(current, |pending| pending.original);
+        let unchanged = original.display_value().map(|value| value.to_string()) == value;
+        let new_cell = match &value {
+            Some(value) => TableCell::Generated(value.clone().into()),
+            None => TableCell::Null,
+        };
+        if !unchanged {
+            edits.pending.insert(key, PendingEdit { original, value });
+        }
+        edits.error = None;
+        let marked = edits
+            .pending
+            .keys()
+            .map(|(row, col)| DataCellId::new(DataRow(*row), AnyColumn(*col)))
+            .collect::<Vec<_>>();
+        self.table.update(cx, |table, cx| {
+            table.set_cell(cell, new_cell, cx).log_err();
+            table.set_marked_cells(marked, cx);
+        });
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    pub(crate) fn revert_edits(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(edits) = self.edits.as_mut() else {
+            return;
+        };
+        let pending = std::mem::take(&mut edits.pending);
+        edits.error = None;
+        self.table.update(cx, |table, cx| {
+            for ((row, col), edit) in pending {
+                table
+                    .set_cell(
+                        DataCellId::new(DataRow(row), AnyColumn(col)),
+                        edit.original,
+                        cx,
+                    )
+                    .log_err();
+            }
+            table.set_marked_cells([], cx);
+        });
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The `UPDATE` statements that write the pending edits, one per changed row.
+    pub(crate) fn edit_statements(&self, cx: &App) -> Vec<String> {
+        let Some(edits) = &self.edits else {
+            return Vec::new();
+        };
+        let table = self.table.read(cx);
+        let mut rows = BTreeMap::<usize, Vec<(usize, Option<&str>)>>::new();
+        for ((row, col), edit) in &edits.pending {
+            rows.entry(*row)
+                .or_default()
+                .push((*col, edit.value.as_deref()));
+        }
+        rows.into_iter()
+            .filter_map(|(row, assignments)| {
+                let assignments = assignments
+                    .into_iter()
+                    .map(|(col, value)| Some((self.columns.get(col)?.name.as_ref(), value)))
+                    .collect::<Option<Vec<_>>>()?;
+                // Rows are found by their key as loaded, even if the key itself was edited.
+                let key = edits
+                    .key_columns
+                    .iter()
+                    .map(|col| {
+                        let value = match edits.pending.get(&(row, *col)) {
+                            Some(edit) => edit.original.display_value(),
+                            None => table
+                                .cell(DataCellId::new(DataRow(row), AnyColumn(*col)))?
+                                .display_value(),
+                        };
+                        Some((
+                            self.columns.get(*col)?.name.as_ref(),
+                            value.map(|value| value.as_ref()),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(statement::update_statement(
+                    self.config.driver,
+                    &edits.schema,
+                    &edits.relation,
+                    &assignments,
+                    &key,
+                ))
+            })
+            .collect()
+    }
+
+    /// Asks for confirmation with a summary of the changes, then writes them in one transaction.
+    fn commit_edits(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<Result<()>> {
+        let statements = self.edit_statements(cx);
+        if statements.is_empty()
+            || self
+                .edits
+                .as_ref()
+                .is_some_and(|edits| edits.committing.is_some())
+        {
+            return Task::ready(Ok(()));
+        }
+        let mut detail = statements
+            .iter()
+            .take(10)
+            .map(|statement| format!("{statement};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if statements.len() > 10 {
+            detail.push_str(&format!("\n…and {} more", statements.len() - 10));
+        }
+        if self.config.environment == DatabaseEnvironment::Production {
+            detail.insert_str(
+                0,
+                &format!("`{}` is a production connection.\n\n", self.config.key.id),
+            );
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!(
+                "Commit {} change{}?",
+                statements.len(),
+                if statements.len() == 1 { "" } else { "s" }
+            ),
+            Some(&detail),
+            &["Commit", "Cancel"],
+            cx,
+        );
+        let config = self.config.clone();
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                anyhow::bail!("the commit was cancelled");
+            }
+            let commit = this.update(cx, |_, cx| {
+                DbStore::global(cx).update(cx, |store, cx| {
+                    store.execute_transaction(config, Some(project), statements, cx)
+                })
+            })?;
+            let result = commit.await;
+            this.update(cx, |this, cx| {
+                if let Some(edits) = this.edits.as_mut() {
+                    edits.committing = None;
+                    match &result {
+                        Ok(()) => {
+                            edits.pending.clear();
+                            edits.error = None;
+                            this.table
+                                .update(cx, |table, cx| table.set_marked_cells([], cx));
+                        }
+                        Err(error) => edits.error = Some(format!("{error:#}").into()),
+                    }
+                }
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            })?;
+            result
+        })
     }
 
     pub(crate) fn rerun(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
@@ -575,6 +901,8 @@ impl QueryResultsItem {
             }
         }
 
+        let pending_edits = self.pending_edit_count();
+        let edit_error = self.edits.as_ref().and_then(|edits| edits.error.clone());
         let is_active = state.as_ref().is_some_and(QueryState::is_active);
         let can_load_more = run.is_some_and(|run| run.can_load_more());
         let has_table = self.content == Content::Table;
@@ -594,7 +922,45 @@ impl QueryResultsItem {
                     .color(Color::Muted),
             )
             .children(summary)
+            .when(self.is_editable() && pending_edits == 0, |row| {
+                row.child(
+                    Label::new("Double-click a cell to edit")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when_some(edit_error, |row, error| {
+                row.child(
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Error)
+                        .truncate(),
+                )
+            })
             .child(div().flex_1())
+            .when(pending_edits > 0, |row| {
+                row.child(
+                    Label::new(format!(
+                        "{pending_edits} pending change{}",
+                        if pending_edits == 1 { "" } else { "s" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Modified),
+                )
+                .child(
+                    Button::new("revert-edits", "Revert")
+                        .size(ButtonSize::Compact)
+                        .on_click(cx.listener(|this, _, _, cx| this.revert_edits(cx))),
+                )
+                .child(
+                    Button::new("commit-edits", "Commit…")
+                        .size(ButtonSize::Compact)
+                        .style(ui::ButtonStyle::Filled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.commit_edits(window, cx).detach();
+                        })),
+                )
+            })
             .when(can_load_more, |row| {
                 row.child(
                     Button::new("load-more", "Load More")
@@ -887,5 +1253,27 @@ impl Item for QueryResultsItem {
 
     fn show_toolbar(&self) -> bool {
         false
+    }
+
+    fn is_dirty(&self, _: &App) -> bool {
+        self.pending_edit_count() > 0
+    }
+
+    fn can_save(&self, _: &App) -> bool {
+        self.is_editable()
+    }
+
+    fn save(
+        &mut self,
+        options: workspace::item::SaveOptions,
+        _project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<Result<()>> {
+        // Writing to a database must always be a deliberate action.
+        if options.autosave {
+            return Task::ready(Ok(()));
+        }
+        self.commit_edits(window, cx)
     }
 }

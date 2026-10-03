@@ -521,3 +521,135 @@ async fn test_statement_detection_without_a_grammar(cx: &mut TestAppContext) {
     });
     assert_eq!(range.as_deref(), Some("select 2\n  from t"));
 }
+
+#[gpui::test]
+async fn test_edit_cells_and_commit(cx: &mut TestAppContext) {
+    use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow};
+    use workspace::Item as _;
+
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let (project, window, workspace) = open_workspace(cx).await;
+    let panel = add_panel(window, &workspace, cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_entry("fixtures", cx);
+        panel.expand_selected(&menu::SelectChild, window, cx);
+    });
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.entries_text() == ["v fixtures", "  > main"]
+        })
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_entry("main", cx);
+        panel.expand_selected(&menu::SelectChild, window, cx);
+    });
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.entries_text().len() == 4 && panel.entries_text()[3].ends_with("numbers")
+        })
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_entry("numbers", cx);
+        panel.show_rows(&ShowRows, window, cx);
+    });
+    wait_until(cx, |cx| {
+        results(&workspace, cx)
+            .first()
+            .is_some_and(|item| item.read_with(cx, |item, _| item.is_editable()))
+    });
+    let item = results(&workspace, cx).remove(0);
+    wait_until(cx, |cx| {
+        item.read_with(cx, |item, cx| {
+            item.table().read(cx).contents().rows.len() == 100
+        })
+    });
+
+    let label = DataCellId::new(DataRow(0), AnyColumn(1));
+    item.update(cx, |item, cx| {
+        item.apply_edit(label, Some("it's edited".into()), cx);
+        item.apply_edit(DataCellId::new(DataRow(1), AnyColumn(1)), None, cx);
+    });
+    item.read_with(cx, |item, cx| {
+        assert!(item.is_dirty(cx));
+        assert_eq!(
+            item.edit_statements(cx),
+            vec![
+                "UPDATE numbers SET label = 'it''s edited' WHERE n = '1'".to_string(),
+                "UPDATE numbers SET label = NULL WHERE n = '2'".to_string(),
+            ]
+        );
+    });
+
+    // Reverting restores the loaded values.
+    item.update(cx, |item, cx| item.revert_edits(cx));
+    item.read_with(cx, |item, cx| {
+        assert!(!item.is_dirty(cx));
+        assert_eq!(
+            item.table()
+                .read(cx)
+                .cell(label)
+                .and_then(|cell| cell.display_value().cloned())
+                .as_deref(),
+            Some("n1")
+        );
+    });
+
+    // Saving asks for confirmation, then commits.
+    item.update(cx, |item, cx| {
+        item.apply_edit(label, Some("saved".into()), cx)
+    });
+    let save = item.update_in(cx, |item, window, cx| {
+        item.save(Default::default(), project.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("Commit");
+    let mut save = Some(save);
+    let mut result = None;
+    wait_until(cx, |cx| {
+        if let Some(task) = save.take() {
+            let output = std::sync::Arc::new(std::sync::Mutex::new(None));
+            cx.update(|_, cx| {
+                let output = output.clone();
+                gpui::App::spawn(cx, async move |_| {
+                    *output.lock().unwrap() = Some(task.await.map_err(|error| error.to_string()));
+                })
+                .detach();
+            });
+            result = Some(output);
+        }
+        result
+            .as_ref()
+            .is_some_and(|output| output.lock().unwrap().is_some())
+    });
+    assert_eq!(result.unwrap().lock().unwrap().take(), Some(Ok(())));
+    item.read_with(cx, |item, cx| assert!(!item.is_dirty(cx)));
+
+    let store = cx.update(|_, cx| DbStore::global(cx));
+    let config = item.read_with(cx, |item, _| item.config.clone());
+    let check = store.update(cx, |store, cx| {
+        store.execute_for_agent(
+            config,
+            None,
+            "SELECT label FROM numbers WHERE n = 1".into(),
+            1,
+            100,
+            cx,
+        )
+    });
+    let output = std::sync::Arc::new(std::sync::Mutex::new(None));
+    cx.update(|_, cx| {
+        let output = output.clone();
+        gpui::App::spawn(cx, async move |_| {
+            *output.lock().unwrap() = Some(check.await.unwrap());
+        })
+        .detach();
+    });
+    wait_until(cx, |_| output.lock().unwrap().is_some());
+    let result = output.lock().unwrap().take().unwrap();
+    assert_eq!(result.rows[0][0].as_deref(), Some("saved"));
+}

@@ -2,6 +2,7 @@
 //! editors, and showing results in center-pane tabs.
 
 mod connection_modal;
+mod edit;
 mod explain;
 mod history;
 mod panel;
