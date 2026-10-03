@@ -138,6 +138,8 @@ impl TableView {
                 Some(cx.theme().colors().element_selected)
             } else if this.is_cell_selected(display_row, col, selection_range.as_ref()) {
                 Some(cx.theme().colors().element_selection_background)
+            } else if this.marked_cells.contains(&data_cell_id) {
+                Some(cx.theme().status().modified_background)
             } else {
                 None
             };

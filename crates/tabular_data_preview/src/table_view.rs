@@ -136,6 +136,8 @@ pub struct TableView {
     pub(crate) selection: Option<CellSelection>,
     /// Whether `filter_sort_task` is still computing a mapping for the current contents.
     pub(crate) mapping_pending: bool,
+    /// Cells drawn as modified, such as edits that weren't saved yet.
+    pub(crate) marked_cells: std::collections::HashSet<DataCellId>,
 }
 
 impl EventEmitter<TableViewEvent> for TableView {}
@@ -170,6 +172,7 @@ impl TableView {
             is_loading: false,
             selection: None,
             mapping_pending: false,
+            marked_cells: Default::default(),
         }
     }
 
@@ -186,6 +189,28 @@ impl TableView {
 
     pub fn cell(&self, cell: DataCellId) -> Option<&TableCell> {
         self.engine.contents.get_row(cell.row)?.get(cell.col)
+    }
+
+    /// Replaces the value of one cell, keeping sorting, filters and the scroll position.
+    pub fn set_cell(
+        &mut self,
+        cell: DataCellId,
+        value: TableCell,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.engine.set_cell(cell, value)?;
+        cx.notify();
+        Ok(())
+    }
+
+    /// Draws the given cells as modified.
+    pub fn set_marked_cells(
+        &mut self,
+        cells: impl IntoIterator<Item = DataCellId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_cells = cells.into_iter().collect();
+        cx.notify();
     }
 
     pub fn is_loading(&self) -> bool {
@@ -942,6 +967,27 @@ mod tests {
             contents.rows = vec![generated_row(&[Some("1"), Some("2")])];
             view.set_contents(contents, cx);
             assert_eq!(view.selection(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_cell_keeps_mapping(cx: &mut TestAppContext) {
+        let (view, cx) = setup_test_view(cx, 3, 2);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let cell = DataCellId::new(DataRow(1), AnyColumn(1));
+            view.set_cell(cell, TableCell::Null, cx).unwrap();
+            view.set_marked_cells([cell], cx);
+            assert!(view.cell(cell).unwrap().is_null());
+            assert_eq!(view.visible_row_count(), 3);
+            assert!(
+                view.set_cell(
+                    DataCellId::new(DataRow(9), AnyColumn(0)),
+                    TableCell::Null,
+                    cx
+                )
+                .is_err()
+            );
         });
     }
 }

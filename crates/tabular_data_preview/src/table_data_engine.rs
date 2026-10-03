@@ -17,7 +17,7 @@ use crate::{
         filtering_by_column::{FilterEntry, FilterStack, retain_rows},
         sorting_by_column::{AppliedSorting, sort_data_rows},
     },
-    types::{AnyColumn, DataRow, DisplayRow, TableCell, TableLikeContent},
+    types::{AnyColumn, DataCellId, DataRow, DisplayRow, TableCell, TableLikeContent},
 };
 
 pub mod filtering_by_column;
@@ -76,6 +76,22 @@ impl TableDataEngine {
         let end = contents.rows.len();
         self.all_filters.clear();
         start..end
+    }
+
+    pub(crate) fn set_cell(&mut self, cell: DataCellId, value: TableCell) -> anyhow::Result<()> {
+        let contents = Arc::make_mut(&mut self.contents);
+        let row = contents
+            .rows
+            .get_mut(*cell.row)
+            .ok_or_else(|| anyhow::anyhow!("row {:?} doesn't exist", cell.row))?;
+        let target = row
+            .as_mut_slice()
+            .get_mut(*cell.col)
+            .ok_or_else(|| anyhow::anyhow!("column {:?} doesn't exist", cell.col))?;
+        *target = value;
+        // Filter menus list the values of a column.
+        self.all_filters.remove(&cell.col);
+        Ok(())
     }
 
     pub(crate) fn has_any_filter_or_sort(&self) -> bool {
