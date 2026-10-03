@@ -29,7 +29,7 @@ use workspace::{
 
 use crate::{
     CancelQuery, CopyResults, ExportResults, LoadMoreRows, OpenQueryInEditor, ResultFormat,
-    connection_modal::connect_interactively,
+    connection_modal::{connect_interactively, detach_and_notify_err},
 };
 
 actions!(
@@ -88,7 +88,7 @@ pub fn run_query(
     }
     let confirmation = confirm_writes(&request.config, &request.sql, window, cx);
     let workspace_handle = cx.weak_entity();
-    cx.spawn_in(window, async move |workspace, cx| {
+    let task = cx.spawn_in(window, async move |workspace, cx| {
         if !confirmation.await {
             return anyhow::Ok(());
         }
@@ -106,8 +106,8 @@ pub fn run_query(
         workspace.update_in(cx, |workspace, window, cx| {
             show_result(workspace, request, window, cx);
         })
-    })
-    .detach_and_log_err(cx);
+    });
+    detach_and_notify_err(task, cx.weak_entity(), cx);
 }
 
 /// Asks before running statements that write to a production database.

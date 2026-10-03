@@ -26,7 +26,7 @@ use ui::{
 use util::ResultExt as _;
 
 use crate::{
-    connection_modal::connect_interactively,
+    connection_modal::{connect_interactively, detach_and_notify_err},
     results::{QueryRequest, ResultOrigin, confirm_writes, run_query},
 };
 
@@ -62,8 +62,9 @@ pub fn run_inline(
     };
     let confirmation = confirm_writes(&config, &sql, window, cx);
     let workspace = workspace.downgrade();
-    window
-        .spawn(cx, async move |cx| {
+    let task = window.spawn(cx, {
+        let workspace = workspace.clone();
+        async move |cx| {
             if !confirmation.await {
                 return anyhow::Ok(());
             }
@@ -78,8 +79,9 @@ pub fn run_inline(
             })?
             .await?;
             cx.update(|_, cx| show_inline(editor, workspace, config, project, sql, range, cx))
-        })
-        .detach_and_log_err(cx);
+        }
+    });
+    detach_and_notify_err(task, workspace, cx);
 }
 
 fn show_inline(

@@ -815,3 +815,20 @@ async fn test_run_sql_embedded_in_code(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+async fn test_connection_errors_are_shown(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    enable_panel(cx, &directory.path().join("missing.sqlite3"));
+    let (project, window, workspace) = open_workspace(cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let editor = open_file(&project, &workspace, "query.sql", cx).await;
+    place_cursor(&editor, "select 1;", Point::new(0, 3), cx);
+    cx.dispatch_action(RunQuery);
+    wait_until(cx, |cx| {
+        workspace.read_with(cx, |workspace, _| !workspace.notification_ids().is_empty())
+    });
+    assert!(results(&workspace, cx).is_empty());
+}

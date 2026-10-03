@@ -16,7 +16,10 @@ use ui::{
 };
 use workspace::{Item, Workspace, item::ItemEvent};
 
-use crate::{connection_modal::connect_interactively, results::open_text_in_editor};
+use crate::{
+    connection_modal::{connect_interactively, detach_and_notify_err},
+    results::open_text_in_editor,
+};
 
 /// A node of an execution plan.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,7 +44,7 @@ pub fn show_explain(
         window,
         cx,
     );
-    cx.spawn_in(window, async move |workspace, cx| {
+    let task = cx.spawn_in(window, async move |workspace, cx| {
         connect.await?;
         // EXPLAIN without ANALYZE doesn't run the statement; the read-only transaction makes sure
         // of it anyway.
@@ -79,8 +82,8 @@ pub fn show_explain(
         })?;
         telemetry::event!("Database Plan Explained", driver = config.driver.id());
         anyhow::Ok(())
-    })
-    .detach_and_log_err(cx);
+    });
+    detach_and_notify_err(task, cx.weak_entity(), cx);
 }
 
 /// Turns the result of `EXPLAIN` into plan nodes, and the raw plan text.

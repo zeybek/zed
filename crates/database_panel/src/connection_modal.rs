@@ -17,6 +17,7 @@ use ui::{
     Section, Switch, ToggleState, prelude::*,
 };
 use ui_input::InputField;
+use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 /// Adds or edits a connection in user settings.
@@ -792,8 +793,44 @@ pub fn connect_interactively(
         })?;
         result
             .await
-            .map_err(|_| anyhow::anyhow!("the password prompt was closed"))?
+            .map_err(|_| anyhow::Error::new(PasswordPromptClosed))?
     })
+}
+
+/// The user closed the password prompt instead of connecting.
+#[derive(Debug)]
+pub struct PasswordPromptClosed;
+
+impl std::fmt::Display for PasswordPromptClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the password prompt was closed")
+    }
+}
+
+impl std::error::Error for PasswordPromptClosed {}
+
+/// Runs a task that connects or queries in the background, and shows its error in the
+/// workspace, since nothing else would tell the user why nothing happened.
+pub fn detach_and_notify_err(
+    task: Task<Result<()>>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        let Err(error) = task.await else {
+            return;
+        };
+        if error.is::<PasswordPromptClosed>() {
+            return;
+        }
+        log::error!("{error:#}");
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_error(format!("{error:#}"), cx)
+            })
+            .log_err();
+    })
+    .detach();
 }
 
 impl ConnectionModal {

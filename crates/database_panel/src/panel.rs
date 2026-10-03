@@ -34,7 +34,7 @@ use workspace::{
 
 use crate::{
     NewConnection, NewSqlFile, QueryHistory, RefreshSchema, ToggleFocus,
-    connection_modal::{ConnectionModal, connect_interactively},
+    connection_modal::{ConnectionModal, connect_interactively, detach_and_notify_err},
     results::{QueryRequest, ResultOrigin, open_text_in_editor, run_query},
 };
 
@@ -243,8 +243,8 @@ impl DatabasePanel {
         // is being updated, such as when the dock activates the panel.
         self.pending_serialization = cx.spawn(async move |_, cx| {
             async move {
-                let Some(key) = workspace
-                    .read_with(cx, |workspace, _| Self::serialization_key(workspace))?
+                let Some(key) =
+                    workspace.read_with(cx, |workspace, _| Self::serialization_key(workspace))?
                 else {
                     return Ok(());
                 };
@@ -925,7 +925,7 @@ impl DatabasePanel {
             window,
             cx,
         );
-        cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |_, cx| {
             connect.await?;
             let ddl = cx
                 .update(|cx| {
@@ -936,8 +936,8 @@ impl DatabasePanel {
                 .await?;
             cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(ddl)));
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        detach_and_notify_err(task, self.workspace.clone(), cx);
     }
 
     pub(crate) fn copy_name(&mut self, _: &CopyName, _: &mut Window, cx: &mut Context<Self>) {
