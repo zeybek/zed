@@ -48,6 +48,8 @@ members = [
     "crates/credentials_provider",
     "crates/dap",
     "crates/dap_adapters",
+    "crates/database_core",
+    "crates/database_panel",
     "crates/db",
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
@@ -327,6 +329,8 @@ crashes = { path = "crates/crashes" }
 credentials_provider = { path = "crates/credentials_provider" }
 dap = { path = "crates/dap" }
 dap_adapters = { path = "crates/dap_adapters" }
+database_core = { path = "crates/database_core" }
+database_panel = { path = "crates/database_panel" }
 db = { path = "crates/db" }
 debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
@@ -699,6 +703,11 @@ metal = "0.33"
 mime = "0.3.17"
 minidumper = "0.11"
 moka = { version = "0.12.10", features = ["sync"] }
+mysql_async = { version = "0.37", default-features = false, features = [
+    "minimal-rust",
+    "rustls-tls",
+    "tls12",
+] }
 nanoid = "0.4"
 nbformat = "1.2.0"
 nix = "0.30"
@@ -826,6 +835,8 @@ rsa = "0.9.6"
 runtimelib = { version = "1.4.0", default-features = false, features = [
     "async-dispatcher-runtime", "aws-lc-rs"
 ] }
+# Must stay compatible with the `libsqlite3-sys` version above, which only one crate in the graph may link.
+rusqlite = "0.32"
 rust-embed = { version = "8.11", features = ["include-exclude", "compression"] }
 rustc-hash = "2.1.0"
 rustix = { version = "1.1", features = ["fs"] }
@@ -874,6 +885,8 @@ time = { version = "0.3", features = [
 ] }
 tiny_http = "0.12"
 tokio = { version = "1" }
+# 0.7.16+ requires whoami 2 and pulls a second digest/sha2 tree through postgres-protocol 0.6.11+.
+tokio-postgres = "=0.7.15"
 tokio-rustls = { version = "0.26", default-features = false }
 toml = "0.8"
 toml_edit = { version = "0.22", default-features = false, features = [
