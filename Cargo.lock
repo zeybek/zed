@@ -4889,8 +4889,6 @@ dependencies = [
  "telemetry",
  "tempfile",
  "text",
- "theme",
- "theme_settings",
  "ui",
  "ui_input",
  "util",

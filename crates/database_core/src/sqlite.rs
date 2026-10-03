@@ -383,7 +383,7 @@ fn value_kind(declared_type: &str) -> ValueKind {
     } else if declared_type.contains("INT")
         || declared_type.contains("REAL")
         || declared_type.contains("FLOA")
-        || declared_type.contains("DOUB")
+        || declared_type.contains("DOUBLE")
         || declared_type.contains("NUM")
         || declared_type.contains("DEC")
     {
