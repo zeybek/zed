@@ -807,6 +807,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
+            database_panel::initialize(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
         workspace_handle.update(cx, |workspace, cx| {
@@ -1521,6 +1522,8 @@ fn initialize_pane(
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
             toolbar.add_item(image_view_toolbar, window, cx);
+            let sql_editor_toolbar = cx.new(database_panel::SqlEditorToolbar::new);
+            toolbar.add_item(sql_editor_toolbar, window, cx);
         })
     });
 }
@@ -5913,6 +5916,7 @@ mod tests {
                 "context_server",
                 "copilot",
                 "copilot_edit_predictions",
+                "database_panel",
                 "debug_panel",
                 "debugger",
                 "dev",
@@ -6175,6 +6179,7 @@ mod tests {
             git_ui::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
+            database_panel::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);
             copilot_chat::init(

@@ -50,6 +50,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     if !DisableAiSettings::get_global(cx).disable_ai {
         view_items.push(MenuItem::action("Agent Panel", assistant::ToggleFocus));
     }
+    if database_panel::is_enabled(cx) {
+        view_items.push(MenuItem::action(
+            "Database Panel",
+            database_panel::ToggleFocus,
+        ));
+    }
 
     view_items.extend([
         MenuItem::action("Git Panel", git_panel::ToggleFocus),
