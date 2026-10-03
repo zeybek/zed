@@ -892,9 +892,8 @@ impl DatabasePanel {
             return;
         };
         let project = self.project.clone();
-        let workspace = self.workspace.clone();
         let connect = connect_interactively(
-            workspace.clone(),
+            self.workspace.clone(),
             config.clone(),
             project.clone(),
             window,

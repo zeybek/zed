@@ -219,6 +219,15 @@ fn main() {
         return;
     }
 
+    // `zed --database-mcp` bridges an agent's stdio to the database tools of a running Zed.
+    if let Some(socket) = &args.database_mcp {
+        if let Err(error) = database_core::mcp::run_stdio_bridge(socket) {
+            eprintln!("Error: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
     if let Some(socket) = &args.crash_handler {
         crashes::crash_server(socket.as_path(), paths::logs_dir().clone());
@@ -1768,6 +1777,11 @@ struct Args {
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
     askpass: Option<String>,
+
+    /// Used by AI agents to reach the database tools of a running Zed, by having Zed act like
+    /// netcat communicating over a Unix socket.
+    #[arg(long, hide = true)]
+    database_mcp: Option<String>,
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,

@@ -140,7 +140,7 @@ pub enum QuerySource {
 }
 
 /// The result of a query run on behalf of an AI agent.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct CollectedResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,

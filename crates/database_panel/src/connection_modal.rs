@@ -343,7 +343,7 @@ impl ConnectionModal {
 
         let id = config.key.id.clone();
         let content = config.to_content();
-        let remove = original_id.clone().filter(|_| renamed);
+        let remove = original_id.filter(|_| renamed);
         settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
             let connections = settings
                 .project

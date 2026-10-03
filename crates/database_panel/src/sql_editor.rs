@@ -574,7 +574,6 @@ impl PickerDelegate for ConnectionPickerDelegate {
                 store.set_editor_connection(editor_id, root, key, cx)
             });
             if let Some(on_select) = self.on_select.take() {
-                let editor = editor.clone();
                 window.defer(cx, move |window, cx| on_select(editor, window, cx));
             }
         }
@@ -730,10 +729,7 @@ impl Render for SqlEditorToolbar {
                         )
                     }
                 })
-                .on_click({
-                    let editor = editor.clone();
-                    move |_, window, cx| ConnectionPicker::toggle(&editor, None, window, cx)
-                }),
+                .on_click(move |_, window, cx| ConnectionPicker::toggle(&editor, None, window, cx)),
             )
             .map(|row| {
                 if is_running {

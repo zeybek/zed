@@ -8,6 +8,7 @@ mod database_settings;
 mod driver;
 pub mod export;
 mod history;
+pub mod mcp;
 mod mysql;
 mod postgres;
 mod query;
@@ -48,6 +49,7 @@ pub fn init_with_credentials_provider(
     cx: &mut App,
 ) {
     DbStore::init_global(credentials_provider, cx);
+    mcp::init(cx);
 }
 
 #[cfg(test)]

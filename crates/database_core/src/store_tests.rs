@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
-use gpui::{AsyncApp, Entity, TestAppContext};
+use gpui::{AsyncApp, BorrowAppContext as _, Entity, TestAppContext};
 use settings::{DatabaseConnectionContent, SettingsStore};
 
 use crate::{
@@ -421,4 +421,186 @@ fn test_postgres_password_flow(cx: &mut TestAppContext) {
     wait_for(cx, forget).unwrap();
     assert!(credentials.0.lock().unwrap().is_empty());
     let _ = PasswordRequired { message: None };
+}
+
+#[gpui::test]
+async fn test_mcp_tools_for_agents(cx: &mut TestAppContext) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    use project::context_server_store::registry::ContextServerDescriptorRegistry;
+    use project::{FakeFs, Project};
+
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("numbers.sqlite3");
+    create_database(&path, 300);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let panel = settings.database_panel.get_or_insert_default();
+                panel.enabled = Some(true);
+                panel.agent_access = Some(true);
+                let content = serde_json::from_value(serde_json::json!({
+                    "driver": "sqlite",
+                    "path": path.to_string_lossy(),
+                }))
+                .unwrap();
+                settings
+                    .project
+                    .database_connections
+                    .get_or_insert_default()
+                    .insert("fixtures".into(), content);
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", serde_json::json!({})).await;
+    let project = Project::test(fs, ["/project".as_ref()], cx).await;
+    cx.update(|cx| crate::mcp::register_project(&project, cx));
+
+    let descriptor = cx.update(|cx| {
+        ContextServerDescriptorRegistry::default_global(cx)
+            .read(cx)
+            .context_server_descriptor(crate::mcp::CONTEXT_SERVER_ID)
+    });
+    let descriptor = descriptor.expect("the database context server is registered");
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let command = wait_for(
+        cx,
+        cx.update(|cx| descriptor.command(worktree_store, &cx.to_async())),
+    )
+    .unwrap();
+    assert_eq!(command.args[0], crate::mcp::BRIDGE_FLAG);
+    let socket = command.args[1].clone();
+
+    // Talk to the server the way the bridge does, from another thread, while the test pumps the
+    // foreground executor that serves the requests.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = |id: u32, method: &str, params: serde_json::Value| {
+            let message = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+            writeln!(writer, "{message}").unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let responses = vec![
+            request(
+                1,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1" }
+                }),
+            ),
+            request(2, "tools/list", serde_json::json!({})),
+            request(
+                3,
+                "tools/call",
+                serde_json::json!({
+                    "name": "db_list_connections", "arguments": {}
+                }),
+            ),
+            request(
+                4,
+                "tools/call",
+                serde_json::json!({
+                    "name": "db_query",
+                    "arguments": { "connection": "fixtures", "sql": "SELECT n FROM numbers ORDER BY n" }
+                }),
+            ),
+            request(
+                5,
+                "tools/call",
+                serde_json::json!({
+                    "name": "db_query",
+                    "arguments": { "connection": "fixtures", "sql": "DELETE FROM numbers" }
+                }),
+            ),
+            request(
+                6,
+                "tools/call",
+                serde_json::json!({
+                    "name": "db_schema",
+                    "arguments": { "connection": "fixtures", "schema": "main" }
+                }),
+            ),
+            request(
+                7,
+                "prompts/get",
+                serde_json::json!({
+                    "name": "table",
+                    "arguments": { "connection": "fixtures", "table": "numbers" }
+                }),
+            ),
+        ];
+        sender.send(responses).unwrap();
+    });
+    let mut responses = None;
+    for _ in 0..2000 {
+        cx.run_until_parked();
+        if let Ok(received) = receiver.try_recv() {
+            responses = Some(received);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let responses = responses.expect("the MCP server answered");
+
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "zed-database");
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            tool["name"].as_str().unwrap().to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tools.len(), 3);
+    for name in ["db_list_connections", "db_query", "db_schema"] {
+        assert!(tools.iter().any(|tool| tool == name), "missing {name}");
+    }
+    let listing = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(listing.contains("fixtures (SQLite, local)"), "{listing}");
+
+    let query = &responses[3]["result"];
+    assert_eq!(
+        query["structuredContent"]["rows"].as_array().unwrap().len(),
+        200
+    );
+    assert_eq!(query["structuredContent"]["truncated"], true);
+
+    let write = responses[4].to_string();
+    assert!(write.contains("must not modify"), "{write}");
+    let schema = responses[5]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(schema, "numbers");
+    let prompt = responses[6]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.contains("CREATE TABLE numbers"), "{prompt}");
+
+    // Disabling agent access unregisters the server.
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.database_panel.get_or_insert_default().agent_access = Some(false);
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|cx| {
+        ContextServerDescriptorRegistry::default_global(cx)
+            .read(cx)
+            .context_server_descriptor(crate::mcp::CONTEXT_SERVER_ID)
+            .is_none()
+    }));
 }

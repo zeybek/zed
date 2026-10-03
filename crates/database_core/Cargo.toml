@@ -15,20 +15,24 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+context_server.workspace = true
 credentials_provider.workspace = true
 db.workspace = true
+extension.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_tokio.workspace = true
 http_client_tls.workspace = true
 log.workspace = true
 mysql_async.workspace = true
+net.workspace = true
 percent-encoding.workspace = true
 project.workspace = true
 remote.workspace = true
 rusqlite = { workspace = true, features = ["column_decltype", "hooks"] }
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
