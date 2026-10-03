@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use anyhow::Result;
 use database_core::{
@@ -7,11 +7,12 @@ use database_core::{
     export::{ExportColumn, export},
     statement,
 };
-use editor::Editor;
+use editor::{Anchor, Editor};
 use gpui::{
     AnyElement, App, ClipboardItem, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     PromptLevel, SharedString, Subscription, Task, WeakEntity, actions,
 };
+use language::Point;
 use project::Project;
 use tabular_data_preview::{
     TableView, TableViewEvent, TableViewOptions,
@@ -72,6 +73,50 @@ pub struct QueryRequest {
     pub source: QuerySource,
     /// Focus the result tab instead of keeping focus where it is.
     pub focus: bool,
+    /// Where the SQL came from, marked in the editor's gutter while the query runs.
+    pub statement: Option<StatementLocation>,
+}
+
+/// The lines of an editor that a query was run from.
+#[derive(Clone)]
+pub struct StatementLocation {
+    pub editor: WeakEntity<Editor>,
+    pub range: Range<Anchor>,
+}
+
+/// Marks the lines of statements that are running.
+enum RunningStatement {}
+
+impl StatementLocation {
+    pub fn new(editor: &Entity<Editor>, range: Range<Point>, cx: &App) -> Self {
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        Self {
+            editor: editor.downgrade(),
+            range: snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+        }
+    }
+
+    fn mark(&self, cx: &mut App) {
+        let range = self.range.clone();
+        self.editor
+            .update(cx, |editor, cx| {
+                editor.insert_gutter_highlight::<RunningStatement>(
+                    range,
+                    |cx| cx.theme().status().info,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    fn unmark(&self, cx: &mut App) {
+        let range = self.range.clone();
+        self.editor
+            .update(cx, |editor, cx| {
+                editor.remove_gutter_highlights::<RunningStatement>(vec![range], cx)
+            })
+            .ok();
+    }
 }
 
 /// Runs a query after confirming writes to production, connecting (and asking for a password)
@@ -216,7 +261,8 @@ fn show_result(
     };
     item.update(cx, |item, cx| {
         item.config = request.config;
-        item.run_sql(request.sql, request.source, window, cx)
+        item.run_sql(request.sql, request.source, window, cx);
+        item.set_running_statement(request.statement, cx);
     });
 }
 
@@ -258,8 +304,10 @@ pub struct QueryResultsItem {
     content: Content,
     focus_handle: FocusHandle,
     edits: Option<EditState>,
+    running_statement: Option<StatementLocation>,
     _run_subscription: Option<Subscription>,
     _table_subscriptions: [Subscription; 2],
+    _release_subscription: Subscription,
 }
 
 impl EventEmitter<ItemEvent> for QueryResultsItem {}
@@ -296,8 +344,21 @@ impl QueryResultsItem {
             content: Content::Empty,
             focus_handle: cx.focus_handle(),
             edits: None,
+            running_statement: None,
             _run_subscription: None,
             _table_subscriptions: table_subscriptions,
+            _release_subscription: cx.on_release(|this, cx| this.set_running_statement(None, cx)),
+        }
+    }
+
+    /// Marks the statement that the current run came from until the run ends.
+    fn set_running_statement(&mut self, statement: Option<StatementLocation>, cx: &mut App) {
+        if let Some(previous) = self.running_statement.take() {
+            previous.unmark(cx);
+        }
+        if let Some(statement) = statement {
+            statement.mark(cx);
+            self.running_statement = Some(statement);
         }
     }
 
@@ -335,6 +396,7 @@ impl QueryResultsItem {
         if let Some(previous) = self.run.take() {
             previous.update(cx, |run, cx| run.cancel(cx));
         }
+        self.set_running_statement(None, cx);
         self.sql = sql.clone().into();
         self.source = source;
         self.columns.clear();
@@ -393,6 +455,7 @@ impl QueryResultsItem {
                     (run.state.clone(), run.rows_affected)
                 };
                 if !state.is_active() {
+                    self.set_running_statement(None, cx);
                     self.table
                         .update(cx, |table, cx| table.set_loading(false, cx));
                     if self.content == Content::Empty && matches!(state, QueryState::Finished) {
@@ -724,6 +787,7 @@ impl QueryResultsItem {
             origin: self.origin.clone(),
             source: self.source,
             focus: true,
+            statement: None,
         };
         self.workspace
             .update(cx, |workspace, cx| {

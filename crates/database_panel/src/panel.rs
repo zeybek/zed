@@ -907,6 +907,7 @@ impl DatabasePanel {
             sql,
             source: QuerySource::Panel,
             focus: true,
+            statement: None,
         };
         self.workspace
             .update(cx, |workspace, cx| {

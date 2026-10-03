@@ -359,6 +359,7 @@ impl InlineResultView {
             origin: ResultOrigin::Editor(editor.entity_id()),
             source: QuerySource::Editor,
             focus: true,
+            statement: None,
         };
         self.workspace
             .update(cx, |workspace, cx| {

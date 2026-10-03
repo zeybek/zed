@@ -848,3 +848,52 @@ async fn test_connection_errors_are_shown(cx: &mut TestAppContext) {
     });
     assert!(results(&workspace, cx).is_empty());
 }
+
+#[gpui::test]
+async fn test_running_statement_is_marked(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let database = create_database(directory.path());
+    enable_panel(cx, &database);
+    let (project, window, workspace) = open_workspace(cx).await;
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let editor = open_file(&project, &workspace, "query.sql", cx).await;
+    let marked_ranges = |cx: &mut VisualTestContext| {
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            editor
+                .gutter_highlights_in_range(
+                    editor::Anchor::Min..editor::Anchor::Max,
+                    &snapshot.display_snapshot,
+                    cx,
+                )
+                .len()
+        })
+    };
+
+    place_cursor(
+        &editor,
+        "select 1;\n\nwith recursive s(n) as (select 1 union all select n + 1 from s)\nselect count(*) from s;",
+        Point::new(2, 0),
+        cx,
+    );
+    cx.dispatch_action(RunQuery);
+    wait_until(cx, |cx| {
+        results(&workspace, cx).first().is_some_and(|item| {
+            item.read_with(cx, |item, cx| {
+                item.run().is_some_and(|run| run.read(cx).state.is_active())
+            })
+        })
+    });
+    assert_eq!(marked_ranges(cx), 1);
+
+    editor.update_in(cx, |editor, window, cx| {
+        window.focus(&editor.focus_handle(cx), cx)
+    });
+    cx.dispatch_action(crate::CancelQuery);
+    wait_until(cx, |cx| marked_ranges(cx) == 0);
+    let item = results(&workspace, cx).remove(0);
+    item.read_with(cx, |item, cx| {
+        assert!(!item.run().unwrap().read(cx).state.is_active());
+    });
+}

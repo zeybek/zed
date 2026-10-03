@@ -24,7 +24,7 @@ use workspace::{
 use crate::{
     CancelQuery, ClearInlineResults, ExplainQuery, QueryHistory, RunEmbeddedQuery, RunQuery,
     RunQueryInline, RunSelection, SelectConnection,
-    results::{QueryRequest, QueryResultsItem, ResultOrigin, run_query},
+    results::{QueryRequest, QueryResultsItem, ResultOrigin, StatementLocation, run_query},
 };
 
 /// Marks the statement being run, briefly.
@@ -298,6 +298,7 @@ fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Win
         return;
     };
     let editor_id = editor.entity_id();
+    let statement = StatementLocation::new(&editor, range, cx);
     workspace.update(cx, |workspace, cx| {
         if scope == RunScope::Explain {
             crate::explain::show_explain(config, project, sql, window, cx);
@@ -312,6 +313,7 @@ fn run_from_editor(editor: WeakEntity<Editor>, scope: RunScope, window: &mut Win
                 origin: ResultOrigin::Editor(editor_id),
                 source: QuerySource::Editor,
                 focus: false,
+                statement: Some(statement),
             },
             window,
             cx,
@@ -382,7 +384,8 @@ fn run_embedded(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
         }
         return;
     };
-    flash(&editor, range, cx);
+    flash(&editor, range.clone(), cx);
+    let statement = StatementLocation::new(&editor, range, cx);
     let (Some(workspace), Some(project)) = (
         editor.read(cx).workspace(),
         editor.read(cx).project().cloned(),
@@ -400,6 +403,7 @@ fn run_embedded(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
                 origin: ResultOrigin::Editor(editor_id),
                 source: QuerySource::Editor,
                 focus: false,
+                statement: Some(statement),
             },
             window,
             cx,

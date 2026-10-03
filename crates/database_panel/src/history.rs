@@ -248,6 +248,7 @@ impl PickerDelegate for HistoryPickerDelegate {
                 origin,
                 source: QuerySource::Panel,
                 focus: true,
+                statement: None,
             };
             self.workspace
                 .update(cx, |workspace, cx| {
