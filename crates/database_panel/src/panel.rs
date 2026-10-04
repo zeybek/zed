@@ -8,7 +8,9 @@ use std::{
 use anyhow::Context as _;
 use database_core::{
     ColumnInfo, ConnectionConfig, ConnectionKey, ConnectionStatus, DatabaseEnvironment,
-    DatabaseSettings, DbStore, DbStoreEvent, QuerySource, RelationInfo, qualified_name,
+    DatabaseSettings, DbStore, DbStoreEvent, ForeignKeyInfo, IndexInfo, KeyInfo, ObjectRef,
+    QuerySource, RelationInfo, RelationKind, RoutineInfo, RoutineKind, SchemaInfo, SchemaRequest,
+    TriggerInfo, qualified_name,
 };
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent};
@@ -53,6 +55,8 @@ actions!(
         ShowRows,
         /// Copies the definition of the selected table or view.
         CopyDdl,
+        /// Opens the definition of the selected routine, sequence, index or trigger in an editor.
+        ShowDefinition,
         /// Copies the name of the selected item.
         CopyName,
         /// Edits the selected connection.
@@ -68,6 +72,54 @@ enum NodeId {
     Connection(StoredKey),
     Schema(StoredKey, String),
     Relation(StoredKey, String, String),
+    SchemaGroup(StoredKey, String, SchemaGroup),
+    RelationGroup(StoredKey, String, String, RelationGroup),
+}
+
+/// A folder that groups the objects of a schema by kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum SchemaGroup {
+    Tables,
+    Views,
+    MaterializedViews,
+    ForeignTables,
+    Routines,
+    Sequences,
+}
+
+impl SchemaGroup {
+    fn label(self) -> &'static str {
+        match self {
+            SchemaGroup::Tables => "tables",
+            SchemaGroup::Views => "views",
+            SchemaGroup::MaterializedViews => "materialized views",
+            SchemaGroup::ForeignTables => "foreign tables",
+            SchemaGroup::Routines => "routines",
+            SchemaGroup::Sequences => "sequences",
+        }
+    }
+}
+
+/// A folder that groups what belongs to a table or view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum RelationGroup {
+    Columns,
+    Keys,
+    ForeignKeys,
+    Indexes,
+    Triggers,
+}
+
+impl RelationGroup {
+    fn label(self) -> &'static str {
+        match self {
+            RelationGroup::Columns => "columns",
+            RelationGroup::Keys => "keys",
+            RelationGroup::ForeignKeys => "foreign keys",
+            RelationGroup::Indexes => "indexes",
+            RelationGroup::Triggers => "triggers",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -96,8 +148,18 @@ struct SerializedDatabasePanel {
 enum EntryKind {
     Connection,
     Schema(SharedString),
+    /// A folder of a schema with the number of objects in it.
+    SchemaGroup(SharedString, SchemaGroup, usize),
     Relation(SharedString, RelationInfo),
+    /// A folder of a table or view with the number of items in it.
+    RelationGroup(SharedString, SharedString, RelationGroup, usize),
     Column(ColumnInfo),
+    Key(KeyInfo),
+    ForeignKey(ForeignKeyInfo),
+    Index(SharedString, SharedString, IndexInfo),
+    Trigger(SharedString, SharedString, TriggerInfo),
+    Routine(SharedString, RoutineInfo),
+    Sequence(SharedString, SharedString),
     Message(SharedString, Color),
 }
 
@@ -106,6 +168,8 @@ struct Entry {
     depth: usize,
     connection: usize,
     kind: EntryKind,
+    /// Whether the entry's children are shown, because it's expanded or they match the filter.
+    open: bool,
 }
 
 impl Entry {
@@ -114,11 +178,118 @@ impl Entry {
         Some(match &self.kind {
             EntryKind::Connection => NodeId::Connection(key),
             EntryKind::Schema(schema) => NodeId::Schema(key, schema.to_string()),
+            EntryKind::SchemaGroup(schema, group, _) => {
+                NodeId::SchemaGroup(key, schema.to_string(), *group)
+            }
             EntryKind::Relation(schema, relation) => {
                 NodeId::Relation(key, schema.to_string(), relation.name.to_string())
             }
-            EntryKind::Column(_) | EntryKind::Message(..) => return None,
+            EntryKind::RelationGroup(schema, relation, group, _) => {
+                NodeId::RelationGroup(key, schema.to_string(), relation.to_string(), *group)
+            }
+            EntryKind::Column(_)
+            | EntryKind::Key(_)
+            | EntryKind::ForeignKey(_)
+            | EntryKind::Index(..)
+            | EntryKind::Trigger(..)
+            | EntryKind::Routine(..)
+            | EntryKind::Sequence(..)
+            | EntryKind::Message(..) => return None,
         })
+    }
+
+    /// The object whose definition can be shown for this entry.
+    fn object(&self) -> Option<(SharedString, ObjectRef)> {
+        Some(match &self.kind {
+            EntryKind::Routine(schema, routine) => {
+                (schema.clone(), ObjectRef::Routine(routine.clone()))
+            }
+            EntryKind::Sequence(schema, name) => {
+                (schema.clone(), ObjectRef::Sequence(name.clone()))
+            }
+            EntryKind::Index(schema, relation, index) => (
+                schema.clone(),
+                ObjectRef::Index {
+                    relation: relation.clone(),
+                    name: index.name.clone(),
+                },
+            ),
+            EntryKind::Trigger(schema, relation, trigger) => (
+                schema.clone(),
+                ObjectRef::Trigger {
+                    relation: relation.clone(),
+                    name: trigger.name.clone(),
+                },
+            ),
+            _ => return None,
+        })
+    }
+}
+
+/// A node of the tree, built from the schema information the store has loaded, before the
+/// filter is applied.
+struct TreeNode {
+    kind: EntryKind,
+    /// The name the filter matches. Folders and messages have none.
+    name: Option<SharedString>,
+    expanded: bool,
+    children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    fn leaf(kind: EntryKind, name: Option<SharedString>) -> Self {
+        Self {
+            kind,
+            name,
+            expanded: false,
+            children: Vec::new(),
+        }
+    }
+
+    fn message(message: SharedString, color: Color) -> Self {
+        Self::leaf(EntryKind::Message(message, color), None)
+    }
+
+    /// Appends the visible entries of the node and its descendants. While filtering, a node is
+    /// shown when it, an ancestor, or a descendant matches, and its children are shown when it
+    /// is expanded or a descendant matches. Returns whether the node or a descendant matches.
+    fn flatten(
+        self,
+        depth: usize,
+        connection: usize,
+        query: &str,
+        ancestor_matches: bool,
+        entries: &mut Vec<Entry>,
+    ) -> bool {
+        let matches = !query.is_empty()
+            && self
+                .name
+                .as_ref()
+                .is_some_and(|name| matches_filter(name, query));
+        let mut child_entries = Vec::new();
+        let mut child_matches = false;
+        for child in self.children {
+            child_matches |= child.flatten(
+                depth + 1,
+                connection,
+                query,
+                ancestor_matches || matches,
+                &mut child_entries,
+            );
+        }
+        if query.is_empty() || matches || child_matches || ancestor_matches {
+            let open = self.expanded || child_matches;
+            entries.push(Entry {
+                depth,
+                connection,
+                kind: self.kind,
+                open,
+            });
+            if open {
+                entries.extend(child_entries);
+            }
+        }
+        matches || child_matches
     }
 }
 
@@ -296,7 +467,8 @@ impl DatabasePanel {
             .cloned()
     }
 
-    /// Loads whatever expanded nodes of a connected connection haven't been loaded yet.
+    /// Loads whatever expanded nodes of a connected connection haven't been loaded yet. Requests
+    /// that failed aren't repeated here; expanding the node again retries them.
     fn load_expanded(&self, config: ConnectionConfig, cx: &mut Context<Self>) {
         let store = DbStore::global(cx);
         if !store.read(cx).is_connected(&config.key) {
@@ -306,34 +478,68 @@ impl DatabasePanel {
         let project = Some(self.project.clone());
         let mut tasks = Vec::new();
         store.update(cx, |store, cx| {
-            if store.schemas(&config.key).is_none() && !store.is_loading_schemas(&config.key) {
-                tasks.push(store.load_schemas(config.clone(), project.clone(), cx));
+            let needs = |store: &DbStore, request: &SchemaRequest, loaded: bool| {
+                !loaded
+                    && !store.is_loading(&config.key, request)
+                    && store.load_error(&config.key, request).is_none()
+            };
+            if store.schemas(&config.key).is_none() {
+                if needs(store, &SchemaRequest::Schemas, false) {
+                    tasks.push(store.load_schemas(config.clone(), project.clone(), cx));
+                }
                 return;
             }
             for node in &self.expanded {
                 match node {
                     NodeId::Schema(node_key, schema) if *node_key == key => {
-                        if store.relations(&config.key, schema).is_none()
-                            && !store.is_loading_relations(&config.key, schema)
-                        {
+                        let schema = SharedString::from(schema.clone());
+                        let loaded = store.relations(&config.key, &schema).is_some();
+                        if needs(store, &SchemaRequest::Relations(schema.clone()), loaded) {
                             tasks.push(store.load_relations(
                                 config.clone(),
                                 project.clone(),
-                                schema.clone().into(),
+                                schema.clone(),
+                                cx,
+                            ));
+                        }
+                        let loaded = store.schema_objects(&config.key, &schema).is_some();
+                        if needs(store, &SchemaRequest::SchemaObjects(schema.clone()), loaded) {
+                            tasks.push(store.load_schema_objects(
+                                config.clone(),
+                                project.clone(),
+                                schema,
                                 cx,
                             ));
                         }
                     }
                     NodeId::Relation(node_key, schema, relation) if *node_key == key => {
-                        if store.relations(&config.key, schema).is_some()
-                            && store.columns(&config.key, schema, relation).is_none()
-                            && !store.is_loading_columns(&config.key, schema, relation)
-                        {
+                        if store.relations(&config.key, schema).is_none() {
+                            continue;
+                        }
+                        let schema = SharedString::from(schema.clone());
+                        let relation = SharedString::from(relation.clone());
+                        let loaded = store.columns(&config.key, &schema, &relation).is_some();
+                        let request = SchemaRequest::Columns(schema.clone(), relation.clone());
+                        if needs(store, &request, loaded) {
                             tasks.push(store.load_columns(
                                 config.clone(),
                                 project.clone(),
-                                schema.clone().into(),
-                                relation.clone().into(),
+                                schema.clone(),
+                                relation.clone(),
+                                cx,
+                            ));
+                        }
+                        let loaded = store
+                            .relation_details(&config.key, &schema, &relation)
+                            .is_some();
+                        let request =
+                            SchemaRequest::RelationDetails(schema.clone(), relation.clone());
+                        if needs(store, &request, loaded) {
+                            tasks.push(store.load_relation_details(
+                                config.clone(),
+                                project.clone(),
+                                schema,
+                                relation,
                                 cx,
                             ));
                         }
@@ -357,163 +563,14 @@ impl DatabasePanel {
         let store = DbStore::global(cx);
         let store = store.read(cx);
         let mut entries = Vec::new();
-
         for (connection_index, config) in self.connections.iter().enumerate() {
-            let key = StoredKey::from(&config.key);
-            let expanded = self.expanded.contains(&NodeId::Connection(key.clone()));
-            let mut children = Vec::new();
-            let mut child_matches = false;
-            let connection_matches = matches_filter(&config.key.id, &query);
-
-            if expanded || !query.is_empty() {
-                match store.status(&config.key) {
-                    ConnectionStatus::Connecting => {
-                        children.push((1, EntryKind::Message("Connecting…".into(), Color::Muted)));
-                    }
-                    ConnectionStatus::Failed(message) => {
-                        children.push((1, EntryKind::Message(message, Color::Error)));
-                    }
-                    ConnectionStatus::PasswordRequired => {
-                        children.push((
-                            1,
-                            EntryKind::Message(
-                                "A password is required. Connect to enter it.".into(),
-                                Color::Warning,
-                            ),
-                        ));
-                    }
-                    ConnectionStatus::Disconnected => {}
-                    ConnectionStatus::Connected => match store.schemas(&config.key) {
-                        None => {
-                            children.push((1, EntryKind::Message("Loading…".into(), Color::Muted)))
-                        }
-                        Some(schemas) => {
-                            for schema in schemas {
-                                let schema_node =
-                                    NodeId::Schema(key.clone(), schema.name.to_string());
-                                let schema_expanded = self.expanded.contains(&schema_node);
-                                let mut schema_children = Vec::new();
-                                let mut schema_child_matches = false;
-                                if schema_expanded || !query.is_empty() {
-                                    match store.relations(&config.key, &schema.name) {
-                                        None if schema_expanded => schema_children.push((
-                                            2,
-                                            EntryKind::Message("Loading…".into(), Color::Muted),
-                                        )),
-                                        None => {}
-                                        Some(relations) => {
-                                            for relation in relations {
-                                                let relation_node = NodeId::Relation(
-                                                    key.clone(),
-                                                    schema.name.to_string(),
-                                                    relation.name.to_string(),
-                                                );
-                                                let relation_expanded =
-                                                    self.expanded.contains(&relation_node);
-                                                let columns = store.columns(
-                                                    &config.key,
-                                                    &schema.name,
-                                                    &relation.name,
-                                                );
-                                                let matching_columns = columns
-                                                    .into_iter()
-                                                    .flatten()
-                                                    .filter(|column| {
-                                                        !query.is_empty()
-                                                            && matches_filter(&column.name, &query)
-                                                    })
-                                                    .count();
-                                                let relation_matches =
-                                                    matches_filter(&relation.name, &query);
-                                                if !query.is_empty()
-                                                    && !relation_matches
-                                                    && matching_columns == 0
-                                                    && !connection_matches
-                                                {
-                                                    continue;
-                                                }
-                                                schema_child_matches = true;
-                                                schema_children.push((
-                                                    2,
-                                                    EntryKind::Relation(
-                                                        schema.name.clone(),
-                                                        relation.clone(),
-                                                    ),
-                                                ));
-                                                if relation_expanded || matching_columns > 0 {
-                                                    match columns {
-                                                        None => schema_children.push((
-                                                            3,
-                                                            EntryKind::Message(
-                                                                "Loading…".into(),
-                                                                Color::Muted,
-                                                            ),
-                                                        )),
-                                                        Some(columns) => {
-                                                            let ancestor_matches = relation_matches
-                                                                || matches_filter(
-                                                                    &schema.name,
-                                                                    &query,
-                                                                )
-                                                                || connection_matches;
-                                                            for column in columns {
-                                                                if !query.is_empty()
-                                                                    && !ancestor_matches
-                                                                    && !matches_filter(
-                                                                        &column.name,
-                                                                        &query,
-                                                                    )
-                                                                {
-                                                                    continue;
-                                                                }
-                                                                schema_children.push((
-                                                                    3,
-                                                                    EntryKind::Column(
-                                                                        column.clone(),
-                                                                    ),
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let schema_matches = matches_filter(&schema.name, &query);
-                                if !query.is_empty()
-                                    && !schema_matches
-                                    && !schema_child_matches
-                                    && !connection_matches
-                                {
-                                    continue;
-                                }
-                                child_matches = true;
-                                children.push((1, EntryKind::Schema(schema.name.clone())));
-                                if schema_expanded || schema_child_matches {
-                                    children.extend(schema_children);
-                                }
-                            }
-                        }
-                    },
-                }
-            }
-
-            if !query.is_empty() && !connection_matches && !child_matches {
-                continue;
-            }
-            entries.push(Entry {
-                depth: 0,
-                connection: connection_index,
-                kind: EntryKind::Connection,
-            });
-            if expanded || child_matches {
-                entries.extend(children.into_iter().map(|(depth, kind)| Entry {
-                    depth,
-                    connection: connection_index,
-                    kind,
-                }));
-            }
+            self.connection_node(config, store).flatten(
+                0,
+                connection_index,
+                &query,
+                false,
+                &mut entries,
+            );
         }
 
         self.entries = entries;
@@ -523,6 +580,257 @@ impl DatabasePanel {
                 .position(|entry| entry.node_id(&self.connections).as_ref() == Some(&node))
         });
         cx.notify();
+    }
+
+    /// A child that says what is still loading, or why loading it failed.
+    fn pending_node(store: &DbStore, key: &ConnectionKey, request: &SchemaRequest) -> TreeNode {
+        match store.load_error(key, request) {
+            Some(error) => TreeNode::message(error.clone(), Color::Error),
+            None => TreeNode::message("Loading…".into(), Color::Muted),
+        }
+    }
+
+    fn connection_node(&self, config: &ConnectionConfig, store: &DbStore) -> TreeNode {
+        let key = StoredKey::from(&config.key);
+        let children = match store.status(&config.key) {
+            ConnectionStatus::Connecting => {
+                vec![TreeNode::message("Connecting…".into(), Color::Muted)]
+            }
+            ConnectionStatus::Failed(message) => vec![TreeNode::message(message, Color::Error)],
+            ConnectionStatus::PasswordRequired => vec![TreeNode::message(
+                "A password is required. Connect to enter it.".into(),
+                Color::Warning,
+            )],
+            ConnectionStatus::Disconnected => Vec::new(),
+            ConnectionStatus::Connected => match store.schemas(&config.key) {
+                None => vec![Self::pending_node(
+                    store,
+                    &config.key,
+                    &SchemaRequest::Schemas,
+                )],
+                Some(schemas) => schemas
+                    .iter()
+                    .map(|schema| self.schema_node(config, &key, schema, store))
+                    .collect(),
+            },
+        };
+        TreeNode {
+            kind: EntryKind::Connection,
+            name: Some(config.key.id.clone().into()),
+            expanded: self.expanded.contains(&NodeId::Connection(key)),
+            children,
+        }
+    }
+
+    fn schema_node(
+        &self,
+        config: &ConnectionConfig,
+        key: &StoredKey,
+        schema: &SchemaInfo,
+        store: &DbStore,
+    ) -> TreeNode {
+        let schema_name = &schema.name;
+        let group = |group: SchemaGroup, items: Vec<TreeNode>| {
+            (!items.is_empty()).then(|| TreeNode {
+                kind: EntryKind::SchemaGroup(schema_name.clone(), group, items.len()),
+                name: None,
+                expanded: self.expanded.contains(&NodeId::SchemaGroup(
+                    key.clone(),
+                    schema_name.to_string(),
+                    group,
+                )),
+                children: items,
+            })
+        };
+        let children = match store.relations(&config.key, schema_name) {
+            None => vec![Self::pending_node(
+                store,
+                &config.key,
+                &SchemaRequest::Relations(schema_name.clone()),
+            )],
+            Some(relations) => {
+                let relations_of = |kind: RelationKind| {
+                    relations
+                        .iter()
+                        .filter(|relation| relation.kind == kind)
+                        .map(|relation| {
+                            self.relation_node(config, key, schema_name, relation, store)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut children = [
+                    (SchemaGroup::Tables, RelationKind::Table),
+                    (SchemaGroup::Views, RelationKind::View),
+                    (
+                        SchemaGroup::MaterializedViews,
+                        RelationKind::MaterializedView,
+                    ),
+                    (SchemaGroup::ForeignTables, RelationKind::ForeignTable),
+                ]
+                .into_iter()
+                .filter_map(|(kind_group, kind)| group(kind_group, relations_of(kind)))
+                .collect::<Vec<_>>();
+                match store.schema_objects(&config.key, schema_name) {
+                    Some(objects) => {
+                        let routines = objects
+                            .routines
+                            .iter()
+                            .map(|routine| {
+                                TreeNode::leaf(
+                                    EntryKind::Routine(schema_name.clone(), routine.clone()),
+                                    Some(routine.name.clone()),
+                                )
+                            })
+                            .collect();
+                        let sequences = objects
+                            .sequences
+                            .iter()
+                            .map(|sequence| {
+                                TreeNode::leaf(
+                                    EntryKind::Sequence(schema_name.clone(), sequence.clone()),
+                                    Some(sequence.clone()),
+                                )
+                            })
+                            .collect();
+                        children.extend(group(SchemaGroup::Routines, routines));
+                        children.extend(group(SchemaGroup::Sequences, sequences));
+                    }
+                    None => {
+                        if let Some(error) = store.load_error(
+                            &config.key,
+                            &SchemaRequest::SchemaObjects(schema_name.clone()),
+                        ) {
+                            children.push(TreeNode::message(error.clone(), Color::Error));
+                        }
+                    }
+                }
+                children
+            }
+        };
+        TreeNode {
+            kind: EntryKind::Schema(schema_name.clone()),
+            name: Some(schema_name.clone()),
+            expanded: self
+                .expanded
+                .contains(&NodeId::Schema(key.clone(), schema_name.to_string())),
+            children,
+        }
+    }
+
+    fn relation_node(
+        &self,
+        config: &ConnectionConfig,
+        key: &StoredKey,
+        schema: &SharedString,
+        relation: &RelationInfo,
+        store: &DbStore,
+    ) -> TreeNode {
+        let group = |group: RelationGroup, items: Vec<TreeNode>| {
+            (!items.is_empty()).then(|| TreeNode {
+                kind: EntryKind::RelationGroup(
+                    schema.clone(),
+                    relation.name.clone(),
+                    group,
+                    items.len(),
+                ),
+                name: None,
+                expanded: self.expanded.contains(&NodeId::RelationGroup(
+                    key.clone(),
+                    schema.to_string(),
+                    relation.name.to_string(),
+                    group,
+                )),
+                children: items,
+            })
+        };
+        let children = match store.columns(&config.key, schema, &relation.name) {
+            None => vec![Self::pending_node(
+                store,
+                &config.key,
+                &SchemaRequest::Columns(schema.clone(), relation.name.clone()),
+            )],
+            Some(columns) => {
+                let columns = columns
+                    .iter()
+                    .map(|column| {
+                        TreeNode::leaf(EntryKind::Column(column.clone()), Some(column.name.clone()))
+                    })
+                    .collect();
+                let mut children = Vec::from_iter(group(RelationGroup::Columns, columns));
+                match store.relation_details(&config.key, schema, &relation.name) {
+                    Some(details) => {
+                        let keys = details
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                TreeNode::leaf(EntryKind::Key(key.clone()), Some(key.name.clone()))
+                            })
+                            .collect();
+                        let foreign_keys = details
+                            .foreign_keys
+                            .iter()
+                            .map(|foreign_key| {
+                                TreeNode::leaf(
+                                    EntryKind::ForeignKey(foreign_key.clone()),
+                                    Some(foreign_key.name.clone()),
+                                )
+                            })
+                            .collect();
+                        let indexes = details
+                            .indexes
+                            .iter()
+                            .map(|index| {
+                                TreeNode::leaf(
+                                    EntryKind::Index(
+                                        schema.clone(),
+                                        relation.name.clone(),
+                                        index.clone(),
+                                    ),
+                                    Some(index.name.clone()),
+                                )
+                            })
+                            .collect();
+                        let triggers = details
+                            .triggers
+                            .iter()
+                            .map(|trigger| {
+                                TreeNode::leaf(
+                                    EntryKind::Trigger(
+                                        schema.clone(),
+                                        relation.name.clone(),
+                                        trigger.clone(),
+                                    ),
+                                    Some(trigger.name.clone()),
+                                )
+                            })
+                            .collect();
+                        children.extend(group(RelationGroup::Keys, keys));
+                        children.extend(group(RelationGroup::ForeignKeys, foreign_keys));
+                        children.extend(group(RelationGroup::Indexes, indexes));
+                        children.extend(group(RelationGroup::Triggers, triggers));
+                    }
+                    None => {
+                        if let Some(error) = store.load_error(
+                            &config.key,
+                            &SchemaRequest::RelationDetails(schema.clone(), relation.name.clone()),
+                        ) {
+                            children.push(TreeNode::message(error.clone(), Color::Error));
+                        }
+                    }
+                }
+                children
+            }
+        };
+        TreeNode {
+            kind: EntryKind::Relation(schema.clone(), relation.clone()),
+            name: Some(relation.name.clone()),
+            expanded: self.expanded.contains(&NodeId::Relation(
+                key.clone(),
+                schema.to_string(),
+                relation.name.to_string(),
+            )),
+            children,
+        }
     }
 
     fn toggle_expanded(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -568,34 +876,55 @@ impl DatabasePanel {
                 }
             }
             EntryKind::Schema(schema) => {
-                if store.read(cx).relations(&config.key, schema).is_none() {
-                    store
-                        .update(cx, |store, cx| {
-                            store.load_relations(config, project, schema.clone(), cx)
-                        })
-                        .detach_and_log_err(cx);
+                let mut tasks = Vec::new();
+                store.update(cx, |store, cx| {
+                    if store.relations(&config.key, schema).is_none() {
+                        tasks.push(store.load_relations(
+                            config.clone(),
+                            project.clone(),
+                            schema.clone(),
+                            cx,
+                        ));
+                    }
+                    if store.schema_objects(&config.key, schema).is_none() {
+                        tasks.push(store.load_schema_objects(config, project, schema.clone(), cx));
+                    }
+                });
+                for task in tasks {
+                    task.detach_and_log_err(cx);
                 }
             }
             EntryKind::Relation(schema, relation) => {
-                if store
-                    .read(cx)
-                    .columns(&config.key, schema, &relation.name)
-                    .is_none()
-                {
-                    store
-                        .update(cx, |store, cx| {
-                            store.load_columns(
-                                config,
-                                project,
-                                schema.clone(),
-                                relation.name.clone(),
-                                cx,
-                            )
-                        })
-                        .detach_and_log_err(cx);
+                let mut tasks = Vec::new();
+                store.update(cx, |store, cx| {
+                    if store.columns(&config.key, schema, &relation.name).is_none() {
+                        tasks.push(store.load_columns(
+                            config.clone(),
+                            project.clone(),
+                            schema.clone(),
+                            relation.name.clone(),
+                            cx,
+                        ));
+                    }
+                    if store
+                        .relation_details(&config.key, schema, &relation.name)
+                        .is_none()
+                    {
+                        tasks.push(store.load_relation_details(
+                            config,
+                            project,
+                            schema.clone(),
+                            relation.name.clone(),
+                            cx,
+                        ));
+                    }
+                });
+                for task in tasks {
+                    task.detach_and_log_err(cx);
                 }
             }
-            EntryKind::Column(_) | EntryKind::Message(..) => {}
+            // Folders show what their parent loaded; other entries have no children.
+            _ => {}
         }
         self.update_entries(cx);
     }
@@ -628,7 +957,11 @@ impl DatabasePanel {
     fn is_expandable(entry: &Entry) -> bool {
         matches!(
             entry.kind,
-            EntryKind::Connection | EntryKind::Schema(_) | EntryKind::Relation(..)
+            EntryKind::Connection
+                | EntryKind::Schema(_)
+                | EntryKind::SchemaGroup(..)
+                | EntryKind::Relation(..)
+                | EntryKind::RelationGroup(..)
         )
     }
 
@@ -687,10 +1020,7 @@ impl DatabasePanel {
         else {
             return;
         };
-        let is_expanded = entry
-            .node_id(&self.connections)
-            .is_some_and(|node| self.expanded.contains(&node));
-        if Self::is_expandable(&entry) && !is_expanded {
+        if Self::is_expandable(&entry) && !entry.open {
             self.expand(&entry, window, cx);
         } else if let Some(index) = self.selected
             && self
@@ -734,11 +1064,81 @@ impl DatabasePanel {
         let Some(index) = self.selected else {
             return;
         };
-        match self.entries.get(index).map(|entry| entry.kind.clone()) {
-            Some(EntryKind::Relation(..)) => self.show_rows(&ShowRows, window, cx),
-            Some(_) => self.toggle_expanded(index, window, cx),
-            None => {}
+        self.activate(index, window, cx);
+    }
+
+    /// Opens what the entry stands for: the rows of a table, or the definition of an object.
+    /// Other entries are expanded or collapsed.
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        if matches!(entry.kind, EntryKind::Relation(..)) {
+            self.show_rows(&ShowRows, window, cx);
+        } else if entry.object().is_some() {
+            self.show_definition(&ShowDefinition, window, cx);
+        } else {
+            self.toggle_expanded(index, window, cx);
         }
+    }
+
+    fn selected_object(&self) -> Option<(ConnectionConfig, SharedString, ObjectRef)> {
+        let entry = self.entries.get(self.selected?)?;
+        let (schema, object) = entry.object()?;
+        Some((
+            self.connections.get(entry.connection)?.clone(),
+            schema,
+            object,
+        ))
+    }
+
+    pub(crate) fn show_definition(
+        &mut self,
+        _: &ShowDefinition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((config, schema, object)) = self.selected_object() else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        let connect = connect_interactively(
+            workspace.clone(),
+            config.clone(),
+            project.clone(),
+            window,
+            cx,
+        );
+        let task = cx.spawn_in(window, async move |_, cx| {
+            connect.await?;
+            let definition = cx
+                .update(|_, cx| {
+                    DbStore::global(cx).update(cx, |store, cx| {
+                        store.object_definition(
+                            config.clone(),
+                            Some(project.clone()),
+                            schema,
+                            object,
+                            cx,
+                        )
+                    })
+                })?
+                .await?;
+            cx.update(|window, cx| {
+                open_text_in_editor(
+                    workspace,
+                    project,
+                    definition,
+                    "SQL",
+                    Some(config.key),
+                    window,
+                    cx,
+                )
+            })?;
+            anyhow::Ok(())
+        });
+        detach_and_notify_err(task, self.workspace.clone(), cx);
     }
 
     fn selected_config(&self) -> Option<ConnectionConfig> {
@@ -956,9 +1356,24 @@ impl DatabasePanel {
             EntryKind::Relation(schema, relation) => {
                 qualified_name(config.driver, schema, &relation.name)
             }
+            EntryKind::Routine(schema, routine) => {
+                qualified_name(config.driver, schema, &routine.name)
+            }
+            EntryKind::Sequence(schema, sequence) => {
+                qualified_name(config.driver, schema, sequence)
+            }
             EntryKind::Column(column) => column.name.to_string(),
-            EntryKind::Message(..) => return,
+            EntryKind::Key(key) => key.name.to_string(),
+            EntryKind::ForeignKey(foreign_key) => foreign_key.name.to_string(),
+            EntryKind::Index(_, _, index) => index.name.to_string(),
+            EntryKind::Trigger(_, _, trigger) => trigger.name.to_string(),
+            EntryKind::SchemaGroup(..) | EntryKind::RelationGroup(..) | EntryKind::Message(..) => {
+                return;
+            }
         };
+        if name.is_empty() {
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(name));
     }
 
@@ -1011,7 +1426,19 @@ impl DatabasePanel {
                     )
                     .action("Copy DDL", CopyDdl.boxed_clone())
                     .action("Copy Name", CopyName.boxed_clone()),
-                EntryKind::Column(_) => menu.action("Copy Name", CopyName.boxed_clone()),
+                EntryKind::SchemaGroup(..) | EntryKind::RelationGroup(..) => {
+                    menu.action("Refresh", RefreshSchema.boxed_clone())
+                }
+                EntryKind::Routine(..)
+                | EntryKind::Sequence(..)
+                | EntryKind::Index(..)
+                | EntryKind::Trigger(..) => menu
+                    .action("Show Definition", ShowDefinition.boxed_clone())
+                    .action("Copy Name", CopyName.boxed_clone()),
+                EntryKind::ForeignKey(foreign_key) if foreign_key.name.is_empty() => menu,
+                EntryKind::Column(_) | EntryKind::Key(_) | EntryKind::ForeignKey(_) => {
+                    menu.action("Copy Name", CopyName.boxed_clone())
+                }
                 EntryKind::Message(..) => menu,
             }
         });
@@ -1041,11 +1468,19 @@ impl DatabasePanel {
         let Some(config) = self.connections.get(entry.connection) else {
             return div().into_any_element();
         };
-        let is_expanded = entry
-            .node_id(&self.connections)
-            .is_some_and(|node| self.expanded.contains(&node));
+        let is_expanded = entry.open;
         let store = DbStore::global(cx);
         let store = store.read(cx);
+        let icon = |name: IconName| Some(Icon::new(name).size(IconSize::Small).color(Color::Muted));
+        let detail = |text: String| {
+            Some(
+                Label::new(text)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+                    .into_any_element(),
+            )
+        };
 
         let (icon, label, end_slot): (Option<Icon>, SharedString, Option<AnyElement>) =
             match &entry.kind {
@@ -1132,15 +1567,84 @@ impl DatabasePanel {
                             .into_any_element(),
                     ),
                 ),
+                EntryKind::SchemaGroup(_, group, count) => (
+                    icon(IconName::Folder),
+                    group.label().into(),
+                    detail(count.to_string()),
+                ),
+                EntryKind::RelationGroup(_, _, group, count) => (
+                    icon(IconName::Folder),
+                    group.label().into(),
+                    detail(count.to_string()),
+                ),
+                EntryKind::Routine(_, routine) => (
+                    icon(IconName::Code),
+                    format!("{}({})", routine.name, routine.arguments).into(),
+                    (routine.kind == RoutineKind::Procedure)
+                        .then(|| detail("procedure".to_string()))
+                        .flatten(),
+                ),
+                EntryKind::Sequence(_, sequence) => {
+                    (icon(IconName::ArrowDown10), sequence.clone(), None)
+                }
+                EntryKind::Key(key) => (
+                    icon(IconName::Hash),
+                    key.name.clone(),
+                    detail(column_list(&key.columns)),
+                ),
+                EntryKind::ForeignKey(foreign_key) => (
+                    icon(IconName::Link),
+                    if foreign_key.name.is_empty() {
+                        column_list(&foreign_key.columns).into()
+                    } else {
+                        foreign_key.name.clone()
+                    },
+                    detail(foreign_key_target(foreign_key)),
+                ),
+                EntryKind::Index(_, _, index) => (
+                    icon(IconName::ListTree),
+                    index.name.clone(),
+                    detail(if index.unique {
+                        format!("unique {}", column_list(&index.columns))
+                    } else {
+                        column_list(&index.columns)
+                    }),
+                ),
+                EntryKind::Trigger(_, _, trigger) => (
+                    icon(IconName::BoltOutlined),
+                    trigger.name.clone(),
+                    detail(trigger.description.to_string()),
+                ),
                 EntryKind::Message(message, _) => (None, message.clone(), None),
             };
         let message_color = match &entry.kind {
             EntryKind::Message(_, color) => Some(*color),
             _ => None,
         };
+        // Details that a narrow panel cuts off.
         let tooltip = match &entry.kind {
             EntryKind::Connection => Some(self.connection_tooltip(config, cx)),
             EntryKind::Message(message, _) => Some(message.clone()),
+            EntryKind::Key(key) => {
+                Some(format!("{} {}", key.name, column_list(&key.columns)).into())
+            }
+            EntryKind::ForeignKey(foreign_key) => Some(
+                format!(
+                    "{} {} {}",
+                    foreign_key.name,
+                    column_list(&foreign_key.columns),
+                    foreign_key_target(foreign_key)
+                )
+                .trim()
+                .to_string()
+                .into(),
+            ),
+            EntryKind::Index(_, _, index) => {
+                Some(format!("{} {}", index.name, column_list(&index.columns)).into())
+            }
+            EntryKind::Trigger(_, _, trigger) => {
+                Some(format!("{} {}", trigger.name, trigger.description).into())
+            }
             _ => None,
         };
 
@@ -1167,12 +1671,11 @@ impl DatabasePanel {
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.selected = Some(index);
-                let is_relation = matches!(
-                    this.entries.get(index).map(|entry| &entry.kind),
-                    Some(EntryKind::Relation(..))
-                );
-                if is_relation && event.click_count() >= 2 {
-                    this.show_rows(&ShowRows, window, cx);
+                let opens_something = this.entries.get(index).is_some_and(|entry| {
+                    matches!(entry.kind, EntryKind::Relation(..)) || entry.object().is_some()
+                });
+                if opens_something && event.click_count() >= 2 {
+                    this.activate(index, window, cx);
                 } else if event.click_count() < 2 {
                     this.toggle_expanded(index, window, cx);
                 }
@@ -1270,21 +1773,41 @@ impl DatabasePanel {
             .iter()
             .map(|entry| {
                 let indent = "  ".repeat(entry.depth);
-                let expanded = entry
-                    .node_id(&self.connections)
-                    .map(|node| {
-                        if self.expanded.contains(&node) {
-                            "v "
-                        } else {
-                            "> "
-                        }
-                    })
-                    .unwrap_or("");
+                let expanded = if !Self::is_expandable(entry) {
+                    ""
+                } else if entry.open {
+                    "v "
+                } else {
+                    "> "
+                };
                 let label = match &entry.kind {
                     EntryKind::Connection => self.connections[entry.connection].key.id.to_string(),
                     EntryKind::Schema(schema) => schema.to_string(),
+                    EntryKind::SchemaGroup(_, group, count) => format!("{} {count}", group.label()),
                     EntryKind::Relation(_, relation) => relation.name.to_string(),
+                    EntryKind::RelationGroup(_, _, group, count) => {
+                        format!("{} {count}", group.label())
+                    }
                     EntryKind::Column(column) => format!("{} {}", column.name, column.data_type),
+                    EntryKind::Key(key) => format!("{} {}", key.name, column_list(&key.columns)),
+                    EntryKind::ForeignKey(foreign_key) => format!(
+                        "{} {} {}",
+                        foreign_key.name,
+                        column_list(&foreign_key.columns),
+                        foreign_key_target(foreign_key)
+                    )
+                    .trim()
+                    .to_string(),
+                    EntryKind::Index(_, _, index) => {
+                        format!("{} {}", index.name, column_list(&index.columns))
+                    }
+                    EntryKind::Trigger(_, _, trigger) => {
+                        format!("{} {}", trigger.name, trigger.description)
+                    }
+                    EntryKind::Routine(_, routine) => {
+                        format!("{}({})", routine.name, routine.arguments)
+                    }
+                    EntryKind::Sequence(_, sequence) => sequence.to_string(),
                     EntryKind::Message(message, _) => format!("({message})"),
                 };
                 format!("{indent}{expanded}{label}")
@@ -1305,6 +1828,24 @@ impl DatabasePanel {
         self.filter_editor
             .update(cx, |editor, cx| editor.set_text(filter, window, cx));
     }
+}
+
+/// Column names in parentheses, such as `(id, name)`.
+fn column_list(columns: &[SharedString]) -> String {
+    format!("({})", columns.join(", "))
+}
+
+/// What a foreign key references, such as `→ public.customers (id)`.
+fn foreign_key_target(foreign_key: &ForeignKeyInfo) -> String {
+    let mut target = format!(
+        "→ {}.{}",
+        foreign_key.referenced_schema, foreign_key.referenced_relation
+    );
+    if !foreign_key.referenced_columns.is_empty() {
+        target.push(' ');
+        target.push_str(&column_list(&foreign_key.referenced_columns));
+    }
+    target
 }
 
 fn matches_filter(name: &str, query: &str) -> bool {
@@ -1391,6 +1932,7 @@ impl Render for DatabasePanel {
             .on_action(cx.listener(Self::query_history))
             .on_action(cx.listener(Self::show_rows))
             .on_action(cx.listener(Self::copy_ddl))
+            .on_action(cx.listener(Self::show_definition))
             .on_action(cx.listener(Self::copy_name))
             .child(
                 h_flex()

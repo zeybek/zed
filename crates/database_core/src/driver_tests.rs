@@ -1,7 +1,9 @@
 //! Tests against real database servers. They run only when the server's URL is set:
 //!
 //! - `ZED_DATABASE_TEST_POSTGRES_URL`, e.g. `postgres://zed:zedtest@127.0.0.1:55432/zed_test`
-//! - `ZED_DATABASE_TEST_MYSQL_URL`, e.g. `mysql://zed:zedtest@127.0.0.1:53306/zed_test`
+//! - `ZED_DATABASE_TEST_MYSQL_URL`, e.g. `mysql://zed:zedtest@127.0.0.1:53306/zed_test`. With
+//!   binary logging on, the server needs `log_bin_trust_function_creators` so that the test user
+//!   can create triggers and functions.
 
 use std::{
     collections::HashMap,
@@ -14,7 +16,10 @@ use settings::{DatabaseConnectionContent, DatabaseSslMode};
 
 use crate::{
     connection::{ConnectionConfig, ConnectionKey, ResolvedConnection, SessionOptions},
-    driver::{DatabaseSession, ExecOptions, RelationKind, ResultEvent, ResultStream, ValueKind},
+    driver::{
+        DatabaseSession, ExecOptions, ObjectRef, RelationKind, ResultEvent, ResultStream,
+        RoutineKind, ValueKind,
+    },
     mysql, postgres,
 };
 
@@ -284,6 +289,310 @@ async fn test_postgres_statement_timeout_and_errors() {
             .sanitize_message(&format!("{error:#}"))
             .contains("definitely wrong")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_postgres_schema_objects() {
+    let Some(connection) = resolved("ZED_DATABASE_TEST_POSTGRES_URL", "postgres", |_| {}) else {
+        eprintln!("ZED_DATABASE_TEST_POSTGRES_URL is not set, skipping");
+        return;
+    };
+    let session = connect(&connection).await;
+    let schema = unique_name("zed_objects");
+    run(
+        session.as_ref(),
+        &format!(
+            "CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.customers (id serial PRIMARY KEY, email text UNIQUE);
+             CREATE TABLE {schema}.orders (
+                 id bigint PRIMARY KEY,
+                 customer_id integer REFERENCES {schema}.customers (id),
+                 total numeric
+             );
+             CREATE INDEX orders_customer ON {schema}.orders (customer_id, lower(total::text));
+             CREATE FUNCTION {schema}.touch() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN NEW; END $$;
+             CREATE FUNCTION {schema}.add(a integer, b integer) RETURNS integer
+                 LANGUAGE sql AS 'SELECT a + b';
+             CREATE FUNCTION {schema}.add(a text, b text) RETURNS text
+                 LANGUAGE sql AS 'SELECT a || b';
+             CREATE PROCEDURE {schema}.reset() LANGUAGE sql AS 'SELECT 1';
+             CREATE TRIGGER orders_touch BEFORE INSERT OR UPDATE ON {schema}.orders
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.touch();
+             CREATE SEQUENCE {schema}.invoice_numbers START 100 INCREMENT 5;"
+        ),
+    )
+    .await;
+
+    let objects = session.list_schema_objects(&schema).await.unwrap();
+    assert_eq!(
+        objects
+            .routines
+            .iter()
+            .map(|routine| (
+                routine.name.as_ref(),
+                routine.arguments.as_ref(),
+                routine.kind
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("add", "a integer, b integer", RoutineKind::Function),
+            ("add", "a text, b text", RoutineKind::Function),
+            ("reset", "", RoutineKind::Procedure),
+            ("touch", "", RoutineKind::Function),
+        ]
+    );
+    assert_eq!(objects.sequences, ["customers_id_seq", "invoice_numbers"]);
+
+    let customers = session
+        .list_relation_details(&schema, "customers")
+        .await
+        .unwrap();
+    assert_eq!(
+        customers
+            .keys
+            .iter()
+            .map(|key| (key.name.as_ref(), key.primary, key.columns.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("customers_pkey", true, vec!["id".into()]),
+            ("customers_email_key", false, vec!["email".into()]),
+        ]
+    );
+
+    let orders = session
+        .list_relation_details(&schema, "orders")
+        .await
+        .unwrap();
+    let [foreign_key] = orders.foreign_keys.as_slice() else {
+        panic!("expected one foreign key, got {:?}", orders.foreign_keys);
+    };
+    assert_eq!(foreign_key.name.as_ref(), "orders_customer_id_fkey");
+    assert_eq!(foreign_key.columns, ["customer_id"]);
+    assert_eq!(foreign_key.referenced_schema.as_ref(), schema);
+    assert_eq!(foreign_key.referenced_relation.as_ref(), "customers");
+    assert_eq!(foreign_key.referenced_columns, ["id"]);
+    let [primary, by_customer] = orders.indexes.as_slice() else {
+        panic!("expected two indexes, got {:?}", orders.indexes);
+    };
+    assert!(primary.unique && primary.name.as_ref() == "orders_pkey");
+    assert!(!by_customer.unique);
+    assert_eq!(by_customer.columns[0].as_ref(), "customer_id");
+    assert!(
+        by_customer.columns[1].starts_with("lower("),
+        "{:?}",
+        by_customer.columns
+    );
+    let [trigger] = orders.triggers.as_slice() else {
+        panic!("expected one trigger, got {:?}", orders.triggers);
+    };
+    assert_eq!(trigger.name.as_ref(), "orders_touch");
+    assert_eq!(trigger.description.as_ref(), "BEFORE INSERT OR UPDATE");
+
+    let add = objects.routines[0].clone();
+    let definition = session
+        .object_definition(&schema, &ObjectRef::Routine(add))
+        .await
+        .unwrap();
+    assert!(
+        definition.starts_with(&format!(
+            "CREATE OR REPLACE FUNCTION {schema}.add(a integer, b integer)"
+        )),
+        "{definition}"
+    );
+    let definition = session
+        .object_definition(
+            &schema,
+            &ObjectRef::Trigger {
+                relation: "orders".into(),
+                name: "orders_touch".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        definition.starts_with("CREATE TRIGGER orders_touch BEFORE INSERT OR UPDATE"),
+        "{definition}"
+    );
+    let definition = session
+        .object_definition(
+            &schema,
+            &ObjectRef::Index {
+                relation: "orders".into(),
+                name: "orders_customer".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        definition.starts_with(&format!("CREATE INDEX orders_customer ON {schema}.orders")),
+        "{definition}"
+    );
+    let definition = session
+        .object_definition(&schema, &ObjectRef::Sequence("invoice_numbers".into()))
+        .await
+        .unwrap();
+    assert!(
+        definition.contains("INCREMENT BY 5") && definition.contains("START WITH 100"),
+        "{definition}"
+    );
+
+    run(session.as_ref(), &format!("DROP SCHEMA {schema} CASCADE")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mysql_schema_objects() {
+    let Some(connection) = resolved("ZED_DATABASE_TEST_MYSQL_URL", "mysql", |_| {}) else {
+        eprintln!("ZED_DATABASE_TEST_MYSQL_URL is not set, skipping");
+        return;
+    };
+    let session = connect(&connection).await;
+    let database = connection.database.clone().unwrap_or_default();
+    let prefix = unique_name("objects");
+    let (customers, orders) = (format!("{prefix}_customers"), format!("{prefix}_orders"));
+    for statement in [
+        format!("CREATE TABLE {customers} (id INT PRIMARY KEY, email VARCHAR(100) UNIQUE)"),
+        format!(
+            "CREATE TABLE {orders} (
+                 id INT PRIMARY KEY,
+                 customer_id INT,
+                 total DECIMAL(10, 2),
+                 INDEX {prefix}_by_customer (customer_id, total),
+                 CONSTRAINT {prefix}_customer_fk FOREIGN KEY (customer_id)
+                     REFERENCES {customers} (id)
+             )"
+        ),
+        format!(
+            "CREATE TRIGGER {prefix}_touch BEFORE UPDATE ON {orders} \
+             FOR EACH ROW SET NEW.total = NEW.total"
+        ),
+        format!(
+            "CREATE FUNCTION {prefix}_add(a INT, b INT) RETURNS INT DETERMINISTIC RETURN a + b"
+        ),
+        format!("CREATE PROCEDURE {prefix}_reset(IN amount INT) SELECT amount"),
+    ] {
+        run(session.as_ref(), &statement).await;
+    }
+
+    let objects = session.list_schema_objects(&database).await.unwrap();
+    let routines = objects
+        .routines
+        .iter()
+        .filter(|routine| routine.name.starts_with(&prefix))
+        .map(|routine| {
+            (
+                routine.name.to_string(),
+                routine.arguments.to_string(),
+                routine.kind,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routines,
+        [
+            (
+                format!("{prefix}_add"),
+                "a int, b int".to_string(),
+                RoutineKind::Function
+            ),
+            (
+                format!("{prefix}_reset"),
+                "IN amount int".to_string(),
+                RoutineKind::Procedure
+            ),
+        ]
+    );
+    assert!(objects.sequences.is_empty(), "MySQL has no sequences");
+
+    let details = session
+        .list_relation_details(&database, &orders)
+        .await
+        .unwrap();
+    assert_eq!(
+        details
+            .keys
+            .iter()
+            .map(|key| (key.name.as_ref(), key.primary, key.columns.clone()))
+            .collect::<Vec<_>>(),
+        [("PRIMARY", true, vec!["id".into()])]
+    );
+    let [foreign_key] = details.foreign_keys.as_slice() else {
+        panic!("expected one foreign key, got {:?}", details.foreign_keys);
+    };
+    assert_eq!(foreign_key.name.as_ref(), format!("{prefix}_customer_fk"));
+    assert_eq!(foreign_key.columns, ["customer_id"]);
+    assert_eq!(foreign_key.referenced_schema.as_ref(), database);
+    assert_eq!(foreign_key.referenced_relation.as_ref(), customers);
+    assert_eq!(foreign_key.referenced_columns, ["id"]);
+    assert_eq!(
+        details
+            .indexes
+            .iter()
+            .map(|index| (index.name.to_string(), index.unique, index.columns.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("PRIMARY".to_string(), true, vec!["id".into()]),
+            (
+                format!("{prefix}_by_customer"),
+                false,
+                vec!["customer_id".into(), "total".into()]
+            ),
+        ]
+    );
+    let [trigger] = details.triggers.as_slice() else {
+        panic!("expected one trigger, got {:?}", details.triggers);
+    };
+    assert_eq!(trigger.name.as_ref(), format!("{prefix}_touch"));
+    assert_eq!(trigger.description.as_ref(), "BEFORE UPDATE");
+
+    let add = objects
+        .routines
+        .iter()
+        .find(|routine| routine.name.as_ref() == format!("{prefix}_add"))
+        .cloned()
+        .unwrap();
+    let definition = session
+        .object_definition(&database, &ObjectRef::Routine(add))
+        .await
+        .unwrap();
+    assert!(
+        definition.contains("FUNCTION") && definition.contains("RETURN a + b"),
+        "{definition}"
+    );
+    let definition = session
+        .object_definition(
+            &database,
+            &ObjectRef::Trigger {
+                relation: orders.clone().into(),
+                name: format!("{prefix}_touch").into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(definition.contains("TRIGGER"), "{definition}");
+    let definition = session
+        .object_definition(
+            &database,
+            &ObjectRef::Index {
+                relation: orders.clone().into(),
+                name: format!("{prefix}_by_customer").into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        definition,
+        format!("CREATE INDEX {prefix}_by_customer ON {database}.{orders} (customer_id, total);")
+    );
+
+    for statement in [
+        format!("DROP TABLE {orders}"),
+        format!("DROP TABLE {customers}"),
+        format!("DROP FUNCTION {prefix}_add"),
+        format!("DROP PROCEDURE {prefix}_reset"),
+    ] {
+        run(session.as_ref(), &statement).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

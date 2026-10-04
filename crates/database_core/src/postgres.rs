@@ -12,9 +12,10 @@ use tokio_postgres::{
 use crate::{
     connection::{DriverKind, ResolvedConnection},
     driver::{
-        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, RelationInfo,
-        RelationKind, ResultEvent, ResultStream, RowBatcher, SchemaInfo, ValueKind, blob_value,
-        display_value, qualified_name, quote_identifier,
+        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, ForeignKeyInfo,
+        IndexInfo, KeyInfo, ObjectRef, RelationDetails, RelationInfo, RelationKind, ResultEvent,
+        ResultStream, RoutineInfo, RoutineKind, RowBatcher, SchemaInfo, SchemaObjects, TriggerInfo,
+        ValueKind, blob_value, display_value, qualified_name, quote_identifier,
     },
     tls::{MakeRustlsConnect, client_config},
 };
@@ -307,6 +308,225 @@ impl DatabaseSession for PostgresSession {
         Ok(ddl)
     }
 
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {
+        // Functions that extensions install are left out, like `\df` does.
+        let routines = self
+            .query_strings(
+                "SELECT p.proname::text, p.prokind::text, \
+                 pg_catalog.pg_get_function_identity_arguments(p.oid) \
+                 FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = $1 AND p.prokind IN ('f', 'p') \
+                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                     WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+                     AND d.objid = p.oid AND d.deptype = 'e') \
+                 ORDER BY 1, 3",
+                &[&schema],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(RoutineInfo {
+                    name: row.try_get::<_, String>(0)?.into(),
+                    kind: if row.try_get::<_, String>(1)? == "p" {
+                        RoutineKind::Procedure
+                    } else {
+                        RoutineKind::Function
+                    },
+                    arguments: row.try_get::<_, String>(2)?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sequences = self
+            .query_strings(
+                "SELECT c.relname::text FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'S' ORDER BY 1",
+                &[&schema],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok(row.try_get::<_, String>(0)?.into()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SchemaObjects {
+            routines,
+            sequences,
+        })
+    }
+
+    async fn list_relation_details(&self, schema: &str, relation: &str) -> Result<RelationDetails> {
+        let oid: i64 = self
+            .query_strings(
+                "SELECT c.oid::bigint FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema, &relation],
+            )
+            .await?
+            .first()
+            .with_context(|| format!("relation {schema}.{relation} not found"))?
+            .try_get(0)?;
+        let strings = |values: Vec<String>| values.into_iter().map(Into::into).collect();
+
+        let keys = self
+            .query_strings(
+                "SELECT con.conname::text, con.contype = 'p', \
+                 ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY k(attnum, position) \
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
+                     ORDER BY k.position) \
+                 FROM pg_catalog.pg_constraint con \
+                 WHERE con.conrelid = $1::bigint::oid AND con.contype IN ('p', 'u') \
+                 ORDER BY con.contype = 'p' DESC, con.conname",
+                &[&oid],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(KeyInfo {
+                    name: row.try_get::<_, String>(0)?.into(),
+                    primary: row.try_get(1)?,
+                    columns: strings(row.try_get(2)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let foreign_keys = self
+            .query_strings(
+                "SELECT con.conname::text, \
+                 ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY k(attnum, position) \
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
+                     ORDER BY k.position), \
+                 rn.nspname::text, rc.relname::text, \
+                 ARRAY(SELECT a.attname::text FROM unnest(con.confkey) WITH ORDINALITY k(attnum, position) \
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum \
+                     ORDER BY k.position) \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+                 WHERE con.conrelid = $1::bigint::oid AND con.contype = 'f' \
+                 ORDER BY con.conname",
+                &[&oid],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(ForeignKeyInfo {
+                    name: row.try_get::<_, String>(0)?.into(),
+                    columns: strings(row.try_get(1)?),
+                    referenced_schema: row.try_get::<_, String>(2)?.into(),
+                    referenced_relation: row.try_get::<_, String>(3)?.into(),
+                    referenced_columns: strings(row.try_get(4)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let indexes = self
+            .query_strings(
+                "SELECT ic.relname::text, i.indisunique, \
+                 ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true) \
+                     FROM generate_series(1, i.indnkeyatts) k) \
+                 FROM pg_catalog.pg_index i \
+                 JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
+                 WHERE i.indrelid = $1::bigint::oid \
+                 ORDER BY i.indisprimary DESC, ic.relname",
+                &[&oid],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(IndexInfo {
+                    name: row.try_get::<_, String>(0)?.into(),
+                    unique: row.try_get(1)?,
+                    columns: strings(row.try_get(2)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let triggers = self
+            .query_strings(
+                "SELECT t.tgname::text, t.tgtype::int FROM pg_catalog.pg_trigger t \
+                 WHERE t.tgrelid = $1::bigint::oid AND NOT t.tgisinternal ORDER BY 1",
+                &[&oid],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(TriggerInfo {
+                    name: row.try_get::<_, String>(0)?.into(),
+                    description: trigger_description(row.try_get(1)?).into(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(RelationDetails {
+            keys,
+            foreign_keys,
+            indexes,
+            triggers,
+        })
+    }
+
+    async fn object_definition(&self, schema: &str, object: &ObjectRef) -> Result<String> {
+        let (sql, params): (&str, Vec<&str>) = match object {
+            ObjectRef::Routine(routine) => (
+                "SELECT pg_catalog.pg_get_functiondef(p.oid) FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = $1 AND p.proname = $2 \
+                 AND pg_catalog.pg_get_function_identity_arguments(p.oid) = $3",
+                vec![schema, routine.name.as_ref(), routine.arguments.as_ref()],
+            ),
+            ObjectRef::Index { name, .. } => (
+                "SELECT pg_catalog.pg_get_indexdef(c.oid) FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('i', 'I')",
+                vec![schema, name.as_ref()],
+            ),
+            ObjectRef::Trigger { relation, name } => (
+                "SELECT pg_catalog.pg_get_triggerdef(t.oid, true) FROM pg_catalog.pg_trigger t \
+                 JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND t.tgname = $3",
+                vec![schema, relation.as_ref(), name.as_ref()],
+            ),
+            ObjectRef::Sequence(name) => {
+                let rows = self
+                    .query_strings(
+                        "SELECT data_type::text, start_value, min_value, max_value, \
+                         increment_by, cycle, cache_size FROM pg_catalog.pg_sequences \
+                         WHERE schemaname = $1 AND sequencename = $2",
+                        &[&schema, &name.as_ref()],
+                    )
+                    .await?;
+                let row = rows
+                    .first()
+                    .with_context(|| format!("sequence {schema}.{name} not found"))?;
+                let start: i64 = row.try_get(1)?;
+                let min: i64 = row.try_get(2)?;
+                let max: i64 = row.try_get(3)?;
+                let increment: i64 = row.try_get(4)?;
+                let cycle: bool = row.try_get(5)?;
+                let cache: i64 = row.try_get(6)?;
+                return Ok(format!(
+                    "CREATE SEQUENCE {} AS {}\n    INCREMENT BY {increment}\n    MINVALUE {min}\n    \
+                     MAXVALUE {max}\n    START WITH {start}\n    CACHE {cache}\n    {}CYCLE;",
+                    qualified_name(DriverKind::Postgres, schema, name),
+                    row.try_get::<_, String>(0)?,
+                    if cycle { "" } else { "NO " },
+                ));
+            }
+        };
+        let params = params
+            .iter()
+            .map(|param| param as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        let rows = self.query_strings(sql, &params).await?;
+        let definition: String = rows
+            .first()
+            .with_context(|| format!("{} not found", object.name()))?
+            .try_get(0)?;
+        Ok(format!("{};", definition.trim_end().trim_end_matches(';')))
+    }
+
     fn execute(&self, sql: String, options: ExecOptions) -> ResultStream {
         let client = self.client.clone();
         ResultStream::spawn(Some(self.cancel.clone()), move |mut sender| async move {
@@ -463,5 +683,51 @@ fn value_kind(type_: &Type) -> ValueKind {
             Kind::Domain(inner) => value_kind(inner),
             _ => ValueKind::Text,
         },
+    }
+}
+
+/// Describes a trigger from `pg_trigger.tgtype`, such as `BEFORE INSERT OR UPDATE`.
+fn trigger_description(trigger_type: i32) -> String {
+    const BEFORE: i32 = 1 << 1;
+    const INSERT: i32 = 1 << 2;
+    const DELETE: i32 = 1 << 3;
+    const UPDATE: i32 = 1 << 4;
+    const TRUNCATE: i32 = 1 << 5;
+    const INSTEAD: i32 = 1 << 6;
+    let timing = if trigger_type & INSTEAD != 0 {
+        "INSTEAD OF"
+    } else if trigger_type & BEFORE != 0 {
+        "BEFORE"
+    } else {
+        "AFTER"
+    };
+    let events = [
+        (INSERT, "INSERT"),
+        (UPDATE, "UPDATE"),
+        (DELETE, "DELETE"),
+        (TRUNCATE, "TRUNCATE"),
+    ]
+    .iter()
+    .filter(|(flag, _)| trigger_type & flag != 0)
+    .map(|(_, event)| *event)
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    format!("{timing} {events}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trigger_description() {
+        // Row-level BEFORE INSERT OR UPDATE.
+        assert_eq!(
+            trigger_description(1 | 2 | 4 | 16),
+            "BEFORE INSERT OR UPDATE"
+        );
+        assert_eq!(trigger_description(8), "AFTER DELETE");
+        assert_eq!(trigger_description(1 | 64 | 4), "INSTEAD OF INSERT");
+        assert_eq!(trigger_description(32), "AFTER TRUNCATE");
     }
 }

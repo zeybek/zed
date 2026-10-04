@@ -146,12 +146,20 @@ Passwords for project connections are stored in the keychain separately for each
 
 ## Browsing Schemas {#browsing-schemas}
 
-Expand a connection to see its schemas, tables, views, and columns.
-Double-click a table or view to open its first 100 rows, or right-click it to copy its name or definition.
-Right-click a connection to connect, disconnect, open a new SQL file, or edit and delete it.
+Expand a connection to see its schemas.
+Each schema groups its objects into folders: tables, views, materialized views, foreign tables, routines (functions and procedures), and sequences.
+Each table or view groups its columns, keys, foreign keys, indexes, and triggers.
+Folders show how many objects they contain, and empty folders are hidden.
 
-Use the filter at the top of the panel to find connections, schemas, tables, and columns by name.
+- Double-click a table or view to open its first 100 rows, or right-click it to copy its name or definition.
+- Double-click a routine, sequence, index, or trigger to open its definition in an editor ({#action database_panel::ShowDefinition}).
+- Right-click a connection to connect, disconnect, open a new SQL file, or edit and delete it.
+
+SQLite has no routines or sequences, and MySQL has no sequences; MariaDB lists its sequences.
+
+Use the filter at the top of the panel to find any object by name, including the columns, keys, indexes, and triggers of tables you've expanded.
 Use {#action database_panel::RefreshSchema} after changing the schema outside of Zed.
+If loading part of the schema fails, for example because of missing privileges, the panel shows the error in its place; expand the item again to retry.
 
 ## Running SQL {#running-sql}
 

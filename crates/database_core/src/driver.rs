@@ -49,6 +49,94 @@ pub struct ColumnInfo {
     pub primary_key: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineInfo {
+    pub name: SharedString,
+    pub kind: RoutineKind,
+    /// The argument list, such as `a integer, b text`, which tells overloads apart.
+    pub arguments: SharedString,
+}
+
+/// Objects of a schema other than its tables and views.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchemaObjects {
+    pub routines: Vec<RoutineInfo>,
+    pub sequences: Vec<SharedString>,
+}
+
+/// A primary key or unique constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub name: SharedString,
+    pub primary: bool,
+    pub columns: Vec<SharedString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub name: SharedString,
+    pub columns: Vec<SharedString>,
+    pub referenced_schema: SharedString,
+    pub referenced_relation: SharedString,
+    pub referenced_columns: Vec<SharedString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexInfo {
+    pub name: SharedString,
+    /// Column names, or expressions for indexes on expressions.
+    pub columns: Vec<SharedString>,
+    pub unique: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerInfo {
+    pub name: SharedString,
+    /// When the trigger fires and on which events, such as `BEFORE UPDATE`.
+    pub description: SharedString,
+}
+
+/// What belongs to a table or view besides its columns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelationDetails {
+    pub keys: Vec<KeyInfo>,
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub indexes: Vec<IndexInfo>,
+    pub triggers: Vec<TriggerInfo>,
+}
+
+/// A schema object whose definition can be shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectRef {
+    Routine(RoutineInfo),
+    Sequence(SharedString),
+    Index {
+        relation: SharedString,
+        name: SharedString,
+    },
+    Trigger {
+        relation: SharedString,
+        name: SharedString,
+    },
+}
+
+impl ObjectRef {
+    pub fn name(&self) -> &SharedString {
+        match self {
+            ObjectRef::Routine(routine) => &routine.name,
+            ObjectRef::Sequence(name)
+            | ObjectRef::Index { name, .. }
+            | ObjectRef::Trigger { name, .. } => name,
+        }
+    }
+}
+
 /// How the values of a result column compare, derived from its database type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ValueKind {
@@ -105,6 +193,10 @@ pub trait DatabaseSession: Send + Sync {
     async fn list_columns(&self, schema: &str, relation: &str) -> Result<Vec<ColumnInfo>>;
     /// A `CREATE` statement that recreates the relation.
     async fn relation_ddl(&self, schema: &str, relation: &str) -> Result<String>;
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects>;
+    async fn list_relation_details(&self, schema: &str, relation: &str) -> Result<RelationDetails>;
+    /// The statement that defines the object, as the database reports it.
+    async fn object_definition(&self, schema: &str, object: &ObjectRef) -> Result<String>;
     /// Executes SQL, streaming results as they arrive.
     ///
     /// The stream applies backpressure: when it isn't polled, the driver stops reading from the

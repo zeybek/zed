@@ -8,13 +8,15 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
+use gpui::SharedString;
 use rusqlite::{Connection, InterruptHandle, OpenFlags, types::ValueRef};
 
 use crate::{
     connection::{DriverKind, ResolvedConnection},
     driver::{
-        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, RelationInfo,
-        RelationKind, ResultEvent, ResultSender, ResultStream, RowBatcher, SchemaInfo, ValueKind,
+        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, ForeignKeyInfo,
+        IndexInfo, KeyInfo, ObjectRef, RelationDetails, RelationInfo, RelationKind, ResultEvent,
+        ResultSender, ResultStream, RowBatcher, SchemaInfo, SchemaObjects, TriggerInfo, ValueKind,
         blob_value, display_value, quote_identifier,
     },
     statement::split_statements,
@@ -235,6 +237,186 @@ impl DatabaseSession for SqliteSession {
         .await
     }
 
+    async fn list_schema_objects(&self, _schema: &str) -> Result<SchemaObjects> {
+        // SQLite has neither stored routines nor sequences.
+        Ok(SchemaObjects::default())
+    }
+
+    async fn list_relation_details(&self, schema: &str, relation: &str) -> Result<RelationDetails> {
+        let schema_name = quote_identifier(DriverKind::Sqlite, schema);
+        let referenced_schema = SharedString::from(schema.to_string());
+        let (schema, relation) = (sql_string(schema), sql_string(relation));
+        self.with_connection(move |connection| {
+            let index_columns = |index: &str| -> Result<Vec<SharedString>> {
+                Ok(query_strings(
+                    connection,
+                    &format!(
+                        "SELECT name FROM pragma_index_info({}, {schema}) ORDER BY seqno",
+                        sql_string(index)
+                    ),
+                    1,
+                )?
+                .into_iter()
+                .filter_map(|row| row.into_iter().next())
+                // Expressions have no name.
+                .map(|name| {
+                    if name.is_empty() {
+                        "<expression>".into()
+                    } else {
+                        name.into()
+                    }
+                })
+                .collect())
+            };
+
+            let index_list = query_strings(
+                connection,
+                &format!(
+                    "SELECT name, \"unique\", origin FROM pragma_index_list({relation}, {schema}) \
+                     ORDER BY origin = 'pk' DESC, name"
+                ),
+                3,
+            )?;
+            let mut indexes = Vec::new();
+            let mut keys = Vec::new();
+            for row in index_list {
+                let [name, unique, origin] = <[String; 3]>::try_from(row).unwrap_or_default();
+                let columns = index_columns(&name)?;
+                if origin == "u" {
+                    keys.push(KeyInfo {
+                        name: name.clone().into(),
+                        primary: false,
+                        columns: columns.clone(),
+                    });
+                }
+                indexes.push(IndexInfo {
+                    name: name.into(),
+                    unique: unique == "1",
+                    columns,
+                });
+            }
+
+            // A primary key on a rowid table has no index, so it's read from the columns.
+            let primary_key_columns = query_strings(
+                connection,
+                &format!(
+                    "SELECT name FROM pragma_table_info({relation}, {schema}) \
+                     WHERE pk > 0 ORDER BY pk"
+                ),
+                1,
+            )?
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .map(SharedString::from)
+            .collect::<Vec<_>>();
+            if !primary_key_columns.is_empty() {
+                keys.insert(
+                    0,
+                    KeyInfo {
+                        name: "PRIMARY KEY".into(),
+                        primary: true,
+                        columns: primary_key_columns,
+                    },
+                );
+            }
+
+            let mut foreign_keys: Vec<(String, ForeignKeyInfo)> = Vec::new();
+            let foreign_key_rows = query_strings(
+                connection,
+                &format!(
+                    "SELECT id, \"table\", \"from\", \"to\" \
+                     FROM pragma_foreign_key_list({relation}, {schema}) ORDER BY id, seq"
+                ),
+                4,
+            )?;
+            for row in foreign_key_rows {
+                let [id, table, from, to] = <[String; 4]>::try_from(row).unwrap_or_default();
+                match foreign_keys.last_mut() {
+                    Some((last_id, foreign_key)) if *last_id == id => {
+                        foreign_key.columns.push(from.into());
+                        if !to.is_empty() {
+                            foreign_key.referenced_columns.push(to.into());
+                        }
+                    }
+                    _ => {
+                        foreign_keys.push((
+                            id,
+                            ForeignKeyInfo {
+                                // SQLite doesn't keep the names of foreign keys.
+                                name: SharedString::default(),
+                                columns: vec![from.into()],
+                                referenced_schema: referenced_schema.clone(),
+                                referenced_relation: table.into(),
+                                // Without target columns, the key references the primary key.
+                                referenced_columns: if to.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![to.into()]
+                                },
+                            },
+                        ));
+                    }
+                }
+            }
+
+            let triggers = query_strings(
+                connection,
+                &format!(
+                    "SELECT name, sql FROM {schema_name}.sqlite_master \
+                     WHERE type = 'trigger' AND tbl_name = {relation} ORDER BY name"
+                ),
+                2,
+            )?
+            .into_iter()
+            .map(|row| {
+                let [name, sql] = <[String; 2]>::try_from(row).unwrap_or_default();
+                TriggerInfo {
+                    name: name.into(),
+                    description: trigger_description(&sql).into(),
+                }
+            })
+            .collect();
+
+            Ok(RelationDetails {
+                keys,
+                foreign_keys: foreign_keys
+                    .into_iter()
+                    .map(|(_, foreign_key)| foreign_key)
+                    .collect(),
+                indexes,
+                triggers,
+            })
+        })
+        .await
+    }
+
+    async fn object_definition(&self, schema: &str, object: &ObjectRef) -> Result<String> {
+        let kind = match object {
+            ObjectRef::Index { .. } => "index",
+            ObjectRef::Trigger { .. } => "trigger",
+            ObjectRef::Routine(_) | ObjectRef::Sequence(_) => {
+                anyhow::bail!("SQLite has no {}", object.name())
+            }
+        };
+        let name = object.name().to_string();
+        let sql = format!(
+            "SELECT sql FROM {}.sqlite_master WHERE type = '{kind}' AND name = {}",
+            quote_identifier(DriverKind::Sqlite, schema),
+            sql_string(&name)
+        );
+        self.with_connection(move |connection| {
+            let definition = query_strings(connection, &sql, 1)?
+                .into_iter()
+                .filter_map(|row| row.into_iter().next())
+                .find(|definition| !definition.is_empty())
+                .with_context(|| {
+                    format!("{name} was created automatically for a constraint of its table")
+                })?;
+            Ok(format!("{definition};"))
+        })
+        .await
+    }
+
     fn execute(&self, sql: String, options: ExecOptions) -> ResultStream {
         let connection = self.connection.clone();
         let state = self.cancel.clone();
@@ -399,9 +581,51 @@ fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Describes a trigger from its `CREATE TRIGGER` statement, such as `AFTER INSERT`.
+fn trigger_description(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let header = upper
+        .split_whitespace()
+        .take_while(|word| *word != "ON")
+        .collect::<Vec<_>>();
+    let timing = if header.windows(2).any(|words| words == ["INSTEAD", "OF"]) {
+        "INSTEAD OF"
+    } else if header.contains(&"AFTER") {
+        "AFTER"
+    } else {
+        "BEFORE"
+    };
+    match ["INSERT", "UPDATE", "DELETE"]
+        .into_iter()
+        .find(|event| header.contains(event))
+    {
+        Some(event) => format!("{timing} {event}"),
+        None => timing.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_trigger_description() {
+        assert_eq!(
+            trigger_description("CREATE TRIGGER t AFTER INSERT ON items BEGIN SELECT 1; END"),
+            "AFTER INSERT"
+        );
+        assert_eq!(
+            trigger_description("create trigger if not exists t update of a on items begin end"),
+            "BEFORE UPDATE"
+        );
+        assert_eq!(
+            trigger_description(
+                "CREATE TRIGGER t INSTEAD OF DELETE ON items_view BEGIN \
+                 INSERT INTO log VALUES ('after update'); END"
+            ),
+            "INSTEAD OF DELETE"
+        );
+    }
     use futures::StreamExt as _;
 
     async fn collect(stream: ResultStream) -> Vec<ResultEvent> {

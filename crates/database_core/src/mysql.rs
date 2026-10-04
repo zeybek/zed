@@ -13,9 +13,11 @@ use tokio::sync::Mutex;
 use crate::{
     connection::{DriverKind, ResolvedConnection},
     driver::{
-        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, RelationInfo,
-        RelationKind, ResultEvent, ResultSender, ResultStream, RowBatcher, SchemaInfo, ValueKind,
-        blob_value, display_value, qualified_name,
+        CancelHandle, ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, ForeignKeyInfo,
+        IndexInfo, KeyInfo, ObjectRef, RelationDetails, RelationInfo, RelationKind, ResultEvent,
+        ResultSender, ResultStream, RoutineInfo, RoutineKind, RowBatcher, SchemaInfo,
+        SchemaObjects, TriggerInfo, ValueKind, blob_value, display_value, qualified_name,
+        quote_identifier,
     },
     statement::split_statements,
 };
@@ -233,7 +235,7 @@ impl DatabaseSession for MysqlSession {
         let rows = self
             .query_rows(
                 "SELECT table_name, table_type FROM information_schema.tables \
-                 WHERE table_schema = ? ORDER BY table_name",
+                 WHERE table_schema = ? AND table_type <> 'SEQUENCE' ORDER BY table_name",
                 vec![Value::from(schema)],
             )
             .await?;
@@ -289,6 +291,259 @@ impl DatabaseSession for MysqlSession {
             .and_then(value_string)
             .with_context(|| format!("no definition returned for {name}"))?;
         Ok(format!("{ddl};"))
+    }
+
+    async fn list_schema_objects(&self, schema: &str) -> Result<SchemaObjects> {
+        let routines = self
+            .query_rows(
+                "SELECT r.routine_name, r.routine_type, \
+                 (SELECT GROUP_CONCAT(CONCAT_WS(' ', \
+                     CASE WHEN r.routine_type = 'PROCEDURE' THEN p.parameter_mode END, \
+                     p.parameter_name, p.dtd_identifier) \
+                     ORDER BY p.ordinal_position SEPARATOR ', ') \
+                  FROM information_schema.parameters p \
+                  WHERE p.specific_schema = r.routine_schema \
+                  AND p.specific_name = r.specific_name AND p.ordinal_position > 0) \
+                 FROM information_schema.routines r \
+                 WHERE r.routine_schema = ? ORDER BY r.routine_name",
+                vec![Value::from(schema)],
+            )
+            .await?
+            .iter()
+            .filter_map(|row| {
+                Some(RoutineInfo {
+                    name: value_string(row.as_ref(0)?)?.into(),
+                    kind: if value_string(row.as_ref(1)?)? == "PROCEDURE" {
+                        RoutineKind::Procedure
+                    } else {
+                        RoutineKind::Function
+                    },
+                    arguments: row
+                        .as_ref(2)
+                        .and_then(value_string)
+                        .unwrap_or_default()
+                        .into(),
+                })
+            })
+            .collect();
+        // Only MariaDB has sequences.
+        let sequences = self
+            .query_rows(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = ? AND table_type = 'SEQUENCE' ORDER BY table_name",
+                vec![Value::from(schema)],
+            )
+            .await?
+            .iter()
+            .filter_map(|row| Some(value_string(row.as_ref(0)?)?.into()))
+            .collect();
+        Ok(SchemaObjects {
+            routines,
+            sequences,
+        })
+    }
+
+    async fn list_relation_details(&self, schema: &str, relation: &str) -> Result<RelationDetails> {
+        let params = || vec![Value::from(schema), Value::from(relation)];
+        let strings = |row: &Row, count: usize| -> Vec<Option<String>> {
+            (0..count)
+                .map(|index| row.as_ref(index).and_then(value_string))
+                .collect()
+        };
+
+        let key_rows = self
+            .query_rows(
+                "SELECT tc.constraint_name, tc.constraint_type, k.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage k \
+                 ON k.constraint_schema = tc.constraint_schema \
+                 AND k.constraint_name = tc.constraint_name AND k.table_name = tc.table_name \
+                 WHERE tc.table_schema = ? AND tc.table_name = ? \
+                 AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE') \
+                 ORDER BY tc.constraint_type = 'PRIMARY KEY' DESC, tc.constraint_name, \
+                 k.ordinal_position",
+                params(),
+            )
+            .await?;
+        let mut keys: Vec<KeyInfo> = Vec::new();
+        for row in &key_rows {
+            let [Some(name), Some(kind), Some(column)] =
+                <[_; 3]>::try_from(strings(row, 3)).unwrap_or_default()
+            else {
+                continue;
+            };
+            match keys.last_mut() {
+                Some(key) if key.name.as_ref() == name => key.columns.push(column.into()),
+                _ => keys.push(KeyInfo {
+                    name: name.into(),
+                    primary: kind == "PRIMARY KEY",
+                    columns: vec![column.into()],
+                }),
+            }
+        }
+
+        let foreign_key_rows = self
+            .query_rows(
+                "SELECT constraint_name, column_name, referenced_table_schema, \
+                 referenced_table_name, referenced_column_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE table_schema = ? AND table_name = ? AND referenced_table_name IS NOT NULL \
+                 ORDER BY constraint_name, ordinal_position",
+                params(),
+            )
+            .await?;
+        let mut foreign_keys: Vec<ForeignKeyInfo> = Vec::new();
+        for row in &foreign_key_rows {
+            let [
+                Some(name),
+                Some(column),
+                Some(referenced_schema),
+                Some(referenced_relation),
+                Some(referenced_column),
+            ] = <[_; 5]>::try_from(strings(row, 5)).unwrap_or_default()
+            else {
+                continue;
+            };
+            match foreign_keys.last_mut() {
+                Some(foreign_key) if foreign_key.name.as_ref() == name => {
+                    foreign_key.columns.push(column.into());
+                    foreign_key
+                        .referenced_columns
+                        .push(referenced_column.into());
+                }
+                _ => foreign_keys.push(ForeignKeyInfo {
+                    name: name.into(),
+                    columns: vec![column.into()],
+                    referenced_schema: referenced_schema.into(),
+                    referenced_relation: referenced_relation.into(),
+                    referenced_columns: vec![referenced_column.into()],
+                }),
+            }
+        }
+
+        let index_rows = self
+            .query_rows(
+                "SELECT index_name, non_unique, column_name FROM information_schema.statistics \
+                 WHERE table_schema = ? AND table_name = ? \
+                 ORDER BY index_name = 'PRIMARY' DESC, index_name, seq_in_index",
+                params(),
+            )
+            .await?;
+        let mut indexes: Vec<IndexInfo> = Vec::new();
+        for row in &index_rows {
+            let [Some(name), Some(non_unique), column] =
+                <[_; 3]>::try_from(strings(row, 3)).unwrap_or_default()
+            else {
+                continue;
+            };
+            // Functional key parts have no column name.
+            let column = column.unwrap_or_else(|| "<expression>".to_string());
+            match indexes.last_mut() {
+                Some(index) if index.name.as_ref() == name => index.columns.push(column.into()),
+                _ => indexes.push(IndexInfo {
+                    name: name.into(),
+                    unique: non_unique == "0",
+                    columns: vec![column.into()],
+                }),
+            }
+        }
+
+        let triggers = self
+            .query_rows(
+                "SELECT trigger_name, action_timing, event_manipulation \
+                 FROM information_schema.triggers \
+                 WHERE event_object_schema = ? AND event_object_table = ? ORDER BY trigger_name",
+                params(),
+            )
+            .await?
+            .iter()
+            .filter_map(|row| {
+                let [Some(name), Some(timing), Some(event)] =
+                    <[_; 3]>::try_from(strings(row, 3)).unwrap_or_default()
+                else {
+                    return None;
+                };
+                Some(TriggerInfo {
+                    name: name.into(),
+                    description: format!("{timing} {event}").into(),
+                })
+            })
+            .collect();
+
+        Ok(RelationDetails {
+            keys,
+            foreign_keys,
+            indexes,
+            triggers,
+        })
+    }
+
+    async fn object_definition(&self, schema: &str, object: &ObjectRef) -> Result<String> {
+        let (statement, column) = match object {
+            ObjectRef::Routine(routine) => {
+                let keyword = match routine.kind {
+                    RoutineKind::Function => "FUNCTION",
+                    RoutineKind::Procedure => "PROCEDURE",
+                };
+                (
+                    format!(
+                        "SHOW CREATE {keyword} {}",
+                        qualified_name(DriverKind::Mysql, schema, &routine.name)
+                    ),
+                    2,
+                )
+            }
+            ObjectRef::Trigger { name, .. } => (
+                format!(
+                    "SHOW CREATE TRIGGER {}",
+                    qualified_name(DriverKind::Mysql, schema, name)
+                ),
+                2,
+            ),
+            ObjectRef::Sequence(name) => (
+                format!(
+                    "SHOW CREATE SEQUENCE {}",
+                    qualified_name(DriverKind::Mysql, schema, name)
+                ),
+                1,
+            ),
+            ObjectRef::Index { relation, name } => {
+                let details = self.list_relation_details(schema, relation).await?;
+                let index = details
+                    .indexes
+                    .iter()
+                    .find(|index| &index.name == name)
+                    .with_context(|| format!("index {name} not found"))?;
+                let columns = index
+                    .columns
+                    .iter()
+                    .map(|column| quote_identifier(DriverKind::Mysql, column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let table = qualified_name(DriverKind::Mysql, schema, relation);
+                return Ok(if name.as_ref() == "PRIMARY" {
+                    format!("ALTER TABLE {table} ADD PRIMARY KEY ({columns});")
+                } else {
+                    format!(
+                        "CREATE {}INDEX {} ON {table} ({columns});",
+                        if index.unique { "UNIQUE " } else { "" },
+                        quote_identifier(DriverKind::Mysql, name),
+                    )
+                });
+            }
+        };
+        let rows = self.query_rows(&statement, Vec::new()).await?;
+        let definition = rows
+            .first()
+            .and_then(|row| row.as_ref(column))
+            .and_then(value_string)
+            .with_context(|| {
+                format!(
+                    "the definition of {} isn't available; it may require more privileges",
+                    object.name()
+                )
+            })?;
+        Ok(format!("{};", definition.trim_end().trim_end_matches(';')))
     }
 
     fn execute(&self, sql: String, options: ExecOptions) -> ResultStream {

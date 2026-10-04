@@ -698,3 +698,42 @@ async fn test_worktree_connection_is_remembered(cx: &mut TestAppContext) {
         assert_eq!(store.worktree_connection(&root), Some(&connection));
     });
 }
+
+#[gpui::test]
+async fn test_failed_schema_requests_are_remembered(cx: &mut TestAppContext) {
+    init_test(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.sqlite3");
+    create_database(&path, 1);
+    let config = sqlite_config("failing-schema", &path);
+    let store = cx.update(|cx| DbStore::global(cx));
+    let missing = crate::SchemaRequest::Relations("missing".into());
+
+    let load = store.update(cx, |store, cx| {
+        store.load_relations(config.clone(), None, "missing".into(), cx)
+    });
+    assert!(wait_for(cx, load).is_err());
+    let error = store.read_with(cx, |store, _| {
+        store.load_error(&config.key, &missing).cloned()
+    });
+    assert!(error.is_some_and(|error| error.contains("missing")));
+
+    // Loading it again clears the error until it fails again; other requests are unaffected.
+    let load = store.update(cx, |store, cx| {
+        store.load_relations(config.clone(), None, "main".into(), cx)
+    });
+    wait_for(cx, load).unwrap();
+    store.read_with(cx, |store, _| {
+        assert!(store.load_error(&config.key, &missing).is_some());
+        assert_eq!(
+            store.relations(&config.key, "main").map(<[_]>::len),
+            Some(1)
+        );
+    });
+
+    // Refreshing the schema forgets failures.
+    store.update(cx, |store, cx| store.refresh_schema(&config.key, cx));
+    store.read_with(cx, |store, _| {
+        assert!(store.load_error(&config.key, &missing).is_none());
+    });
+}

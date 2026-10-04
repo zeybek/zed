@@ -23,8 +23,8 @@ use crate::{
     connection::{ConnectionConfig, ConnectionKey, DriverKind, ResolvedConnection, SessionOptions},
     database_settings::DatabaseSettings,
     driver::{
-        ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, RelationInfo, ResultEvent, ResultRow,
-        SchemaInfo,
+        ColumnInfo, ColumnMeta, DatabaseSession, ExecOptions, ObjectRef, RelationDetails,
+        RelationInfo, ResultEvent, ResultRow, SchemaInfo, SchemaObjects,
     },
     history::{HistoryEntry, QueryHistory},
     mysql, postgres,
@@ -106,7 +106,12 @@ struct ConnectionState {
     schemas: Option<Vec<SchemaInfo>>,
     relations: HashMap<SharedString, Vec<RelationInfo>>,
     columns: HashMap<(SharedString, SharedString), Vec<ColumnInfo>>,
+    schema_objects: HashMap<SharedString, SchemaObjects>,
+    relation_details: HashMap<(SharedString, SharedString), RelationDetails>,
     loading: HashSet<SchemaRequest>,
+    /// Requests that failed. They aren't retried until asked for explicitly, so that a failing
+    /// query isn't repeated whenever the schema changes.
+    failed: HashMap<SchemaRequest, SharedString>,
     active_runs: Vec<WeakEntity<QueryRun>>,
 }
 
@@ -121,17 +126,23 @@ impl Default for ConnectionState {
             schemas: None,
             relations: HashMap::default(),
             columns: HashMap::default(),
+            schema_objects: HashMap::default(),
+            relation_details: HashMap::default(),
             loading: HashSet::default(),
+            failed: HashMap::default(),
             active_runs: Vec::new(),
         }
     }
 }
 
+/// A piece of schema information that is loaded on demand.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SchemaRequest {
+pub enum SchemaRequest {
     Schemas,
     Relations(SharedString),
     Columns(SharedString, SharedString),
+    SchemaObjects(SharedString),
+    RelationDetails(SharedString, SharedString),
 }
 
 /// Where a query was started from, for telemetry.
@@ -364,6 +375,9 @@ impl DbStore {
         state.schemas = None;
         state.relations.clear();
         state.columns.clear();
+        state.schema_objects.clear();
+        state.relation_details.clear();
+        state.failed.clear();
         cx.emit(DbStoreEvent::ConnectionChanged(key.clone()));
         cx.emit(DbStoreEvent::SchemaChanged(key.clone()));
         cx.notify();
@@ -496,6 +510,59 @@ impl DbStore {
             .map(Vec::as_slice)
     }
 
+    pub fn schema_objects(&self, key: &ConnectionKey, schema: &str) -> Option<&SchemaObjects> {
+        self.states.get(key)?.schema_objects.get(schema)
+    }
+
+    pub fn relation_details(
+        &self,
+        key: &ConnectionKey,
+        schema: &str,
+        relation: &str,
+    ) -> Option<&RelationDetails> {
+        self.states.get(key)?.relation_details.get(&(
+            SharedString::from(schema.to_string()),
+            SharedString::from(relation.to_string()),
+        ))
+    }
+
+    pub fn is_loading_schema_objects(&self, key: &ConnectionKey, schema: &str) -> bool {
+        self.states.get(key).is_some_and(|state| {
+            state
+                .loading
+                .contains(&SchemaRequest::SchemaObjects(schema.to_string().into()))
+        })
+    }
+
+    pub fn is_loading_relation_details(
+        &self,
+        key: &ConnectionKey,
+        schema: &str,
+        relation: &str,
+    ) -> bool {
+        self.states.get(key).is_some_and(|state| {
+            state.loading.contains(&SchemaRequest::RelationDetails(
+                schema.to_string().into(),
+                relation.to_string().into(),
+            ))
+        })
+    }
+
+    pub fn is_loading(&self, key: &ConnectionKey, request: &SchemaRequest) -> bool {
+        self.states
+            .get(key)
+            .is_some_and(|state| state.loading.contains(request))
+    }
+
+    /// Why loading the requested information failed, if it did.
+    pub fn load_error(
+        &self,
+        key: &ConnectionKey,
+        request: &SchemaRequest,
+    ) -> Option<&SharedString> {
+        self.states.get(key)?.failed.get(request)
+    }
+
     pub fn is_loading_schemas(&self, key: &ConnectionKey) -> bool {
         self.states
             .get(key)
@@ -554,12 +621,41 @@ impl DbStore {
         )
     }
 
+    pub fn load_schema_objects(
+        &mut self,
+        config: ConnectionConfig,
+        project: Option<Entity<Project>>,
+        schema: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.load(config, project, SchemaRequest::SchemaObjects(schema), cx)
+    }
+
+    pub fn load_relation_details(
+        &mut self,
+        config: ConnectionConfig,
+        project: Option<Entity<Project>>,
+        schema: SharedString,
+        relation: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.load(
+            config,
+            project,
+            SchemaRequest::RelationDetails(schema, relation),
+            cx,
+        )
+    }
+
     /// Drops cached schema information, so that it is fetched again when needed.
     pub fn refresh_schema(&mut self, key: &ConnectionKey, cx: &mut Context<Self>) {
         if let Some(state) = self.states.get_mut(key) {
             state.schemas = None;
             state.relations.clear();
             state.columns.clear();
+            state.schema_objects.clear();
+            state.relation_details.clear();
+            state.failed.clear();
             cx.emit(DbStoreEvent::SchemaChanged(key.clone()));
             cx.notify();
         }
@@ -577,6 +673,7 @@ impl DbStore {
         if !state.loading.insert(request.clone()) {
             return Task::ready(Ok(()));
         }
+        state.failed.remove(&request);
         cx.emit(DbStoreEvent::SchemaChanged(key.clone()));
         let connect = self.ensure_connected(config, project, cx);
         cx.spawn(async move |this, cx| {
@@ -596,6 +693,14 @@ impl DbStore {
                             .list_columns(&schema, &relation)
                             .await
                             .map(|columns| Loaded::Columns(schema, relation, columns)),
+                        SchemaRequest::SchemaObjects(schema) => session
+                            .list_schema_objects(&schema)
+                            .await
+                            .map(|objects| Loaded::SchemaObjects(schema, objects)),
+                        SchemaRequest::RelationDetails(schema, relation) => session
+                            .list_relation_details(&schema, &relation)
+                            .await
+                            .map(|details| Loaded::RelationDetails(schema, relation, details)),
                     };
                     result.map_err(|error| anyhow!(sanitize(&format!("{error:#}"))))
                 })
@@ -615,7 +720,19 @@ impl DbStore {
                             .columns
                             .insert((schema.clone(), relation.clone()), columns.clone());
                     }
-                    Err(_) => {}
+                    Ok(Loaded::SchemaObjects(schema, objects)) => {
+                        state.schema_objects.insert(schema.clone(), objects.clone());
+                    }
+                    Ok(Loaded::RelationDetails(schema, relation, details)) => {
+                        state
+                            .relation_details
+                            .insert((schema.clone(), relation.clone()), details.clone());
+                    }
+                    Err(error) => {
+                        state
+                            .failed
+                            .insert(request.clone(), format!("{error:#}").into());
+                    }
                 }
                 this.mark_disconnected_if_closed(&key, cx);
                 cx.emit(DbStoreEvent::SchemaChanged(key.clone()));
@@ -641,6 +758,30 @@ impl DbStore {
             state.status = ConnectionStatus::Failed("the connection was lost".into());
             cx.emit(DbStoreEvent::ConnectionChanged(key.clone()));
         }
+    }
+
+    /// The statement that defines a routine, sequence, index or trigger.
+    pub fn object_definition(
+        &mut self,
+        config: ConnectionConfig,
+        project: Option<Entity<Project>>,
+        schema: SharedString,
+        object: ObjectRef,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<String>> {
+        let connect = self.ensure_connected(config, project, cx);
+        cx.spawn(async move |_, cx| {
+            let sessions = connect.await?;
+            let session = sessions.metadata.clone();
+            let sanitize = sessions.sanitize.clone();
+            gpui_tokio::Tokio::spawn_result(cx, async move {
+                session
+                    .object_definition(&schema, &object)
+                    .await
+                    .map_err(|error| anyhow!(sanitize(&format!("{error:#}"))))
+            })
+            .await
+        })
     }
 
     pub fn relation_ddl(
@@ -933,6 +1074,8 @@ enum Loaded {
     Schemas(Vec<SchemaInfo>),
     Relations(SharedString, Vec<RelationInfo>),
     Columns(SharedString, SharedString, Vec<ColumnInfo>),
+    SchemaObjects(SharedString, SchemaObjects),
+    RelationDetails(SharedString, SharedString, RelationDetails),
 }
 
 #[derive(Serialize, Deserialize)]

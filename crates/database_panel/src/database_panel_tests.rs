@@ -19,7 +19,7 @@ use workspace::{MultiWorkspace, Workspace};
 use crate::{
     DatabasePanel, QueryResultsItem, RunQuery, RunSelection,
     connection_modal::ConnectionModal,
-    panel::{CopyName, ShowRows},
+    panel::{CopyName, ShowDefinition, ShowRows},
     results::ResultOrigin,
 };
 
@@ -157,67 +157,132 @@ async fn test_panel_tree_and_row_preview(cx: &mut TestAppContext) {
     init_test(cx);
     let directory = tempfile::tempdir().unwrap();
     let database = create_database(directory.path());
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, n INTEGER REFERENCES numbers (n), \
+             body TEXT UNIQUE);
+             CREATE INDEX notes_n ON notes (n);
+             CREATE TRIGGER notes_touch AFTER INSERT ON notes BEGIN SELECT 1; END;",
+        )
+        .unwrap();
     enable_panel(cx, &database);
     let (_project, window, workspace) = open_workspace(cx).await;
     let panel = add_panel(window, &workspace, cx).await;
     let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let expand = |label: &str, cx: &mut VisualTestContext| {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.select_entry(label, cx);
+            panel.expand_selected(&menu::SelectChild, window, cx);
+        });
+    };
+    let entries = |cx: &mut VisualTestContext| panel.read_with(cx, |panel, _| panel.entries_text());
 
-    assert_eq!(
-        panel.read_with(cx, |panel, _| panel.entries_text()),
-        ["> fixtures"]
-    );
+    assert_eq!(entries(cx), ["> fixtures"]);
 
     // Expanding the connection connects and loads schemas.
-    panel.update_in(cx, |panel, window, cx| {
-        panel.select_entry("fixtures", cx);
-        panel.expand_selected(&menu::SelectChild, window, cx);
-    });
+    expand("fixtures", cx);
+    wait_until(cx, |cx| entries(cx) == ["v fixtures", "  > main"]);
+
+    // Schemas group their objects by kind.
+    expand("main", cx);
     wait_until(cx, |cx| {
-        panel.read_with(cx, |panel, _| {
-            panel.entries_text() == ["v fixtures", "  > main"]
-        })
+        entries(cx) == ["v fixtures", "  v main", "    > tables 2", "    > views 1"]
     });
-    panel.update_in(cx, |panel, window, cx| {
-        panel.select_entry("main", cx);
-        panel.expand_selected(&menu::SelectChild, window, cx);
-    });
+    expand("tables 2", cx);
+    expand("notes", cx);
+    expand("numbers", cx);
     wait_until(cx, |cx| {
-        panel.read_with(cx, |panel, _| {
-            panel.entries_text() == ["v fixtures", "  v main", "    > names", "    > numbers"]
-        })
-    });
-    panel.update_in(cx, |panel, window, cx| {
-        panel.select_entry("numbers", cx);
-        panel.expand_selected(&menu::SelectChild, window, cx);
-    });
-    wait_until(cx, |cx| {
-        panel.read_with(cx, |panel, _| {
-            panel.entries_text()
-                == [
-                    "v fixtures",
-                    "  v main",
-                    "    > names",
-                    "    v numbers",
-                    "      n INTEGER",
-                    "      label TEXT",
-                ]
-        })
+        entries(cx)
+            == [
+                "v fixtures",
+                "  v main",
+                "    v tables 2",
+                "      v notes",
+                "        > columns 3",
+                "        > keys 2",
+                "        > foreign keys 1",
+                "        > indexes 2",
+                "        > triggers 1",
+                "      v numbers",
+                "        > columns 2",
+                "        > keys 1",
+                "    > views 1",
+            ]
     });
 
-    // Filtering keeps the matching entries and their ancestors.
-    panel.update_in(cx, |panel, window, cx| panel.set_filter("lab", window, cx));
+    // Tables group their columns, keys, foreign keys, indexes and triggers.
+    for group in [
+        "columns 3",
+        "keys 2",
+        "foreign keys 1",
+        "indexes 2",
+        "triggers 1",
+    ] {
+        expand(group, cx);
+    }
+    assert_eq!(
+        entries(cx)[4..20],
+        [
+            "        v columns 3",
+            "          id INTEGER",
+            "          n INTEGER",
+            "          body TEXT",
+            "        v keys 2",
+            "          PRIMARY KEY (id)",
+            "          sqlite_autoindex_notes_1 (body)",
+            "        v foreign keys 1",
+            "          (n) → main.numbers (n)",
+            "        v indexes 2",
+            "          notes_n (n)",
+            "          sqlite_autoindex_notes_1 (body)",
+            "        v triggers 1",
+            "          notes_touch AFTER INSERT",
+            "      v numbers",
+            "        > columns 2",
+        ]
+    );
+
+    // Filtering keeps the matching entries and their ancestors, and opens their folders.
+    panel.update_in(cx, |panel, window, cx| {
+        panel.set_filter("touch", window, cx)
+    });
     cx.run_until_parked();
     assert_eq!(
-        panel.read_with(cx, |panel, _| panel.entries_text()),
+        entries(cx),
         [
             "v fixtures",
             "  v main",
-            "    v numbers",
-            "      label TEXT"
+            "    v tables 2",
+            "      v notes",
+            "        v triggers 1",
+            "          notes_touch AFTER INSERT",
         ]
     );
     panel.update_in(cx, |panel, window, cx| panel.set_filter("", window, cx));
     cx.run_until_parked();
+
+    // The definition of a trigger opens in an editor.
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_entry("notes_touch AFTER INSERT", cx);
+        panel.show_definition(&ShowDefinition, window, cx);
+    });
+    wait_until(cx, |cx| {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<Editor>(cx)
+                .is_some_and(|editor| editor.read(cx).text(cx).starts_with("CREATE TRIGGER"))
+        })
+    });
+    let definition = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_item_as::<Editor>(cx)
+            .map(|editor| editor.read(cx).text(cx))
+    });
+    assert_eq!(
+        definition.as_deref(),
+        Some("CREATE TRIGGER notes_touch AFTER INSERT ON notes BEGIN SELECT 1; END;")
+    );
 
     panel.update_in(cx, |panel, window, cx| {
         panel.select_entry("numbers", cx);
@@ -586,10 +651,15 @@ async fn test_edit_cells_and_commit(cx: &mut TestAppContext) {
     });
     wait_until(cx, |cx| {
         panel.read_with(cx, |panel, _| {
-            panel.entries_text().len() == 4 && panel.entries_text()[3].ends_with("numbers")
+            panel
+                .entries_text()
+                .iter()
+                .any(|entry| entry.trim() == "> tables 1")
         })
     });
     panel.update_in(cx, |panel, window, cx| {
+        panel.select_entry("tables 1", cx);
+        panel.expand_selected(&menu::SelectChild, window, cx);
         panel.select_entry("numbers", cx);
         panel.show_rows(&ShowRows, window, cx);
     });

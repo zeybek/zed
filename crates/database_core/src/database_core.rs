@@ -28,15 +28,16 @@ pub use connection::{
 };
 pub use database_settings::{DatabaseSettings, MAX_RESULT_ROWS};
 pub use driver::{
-    ColumnInfo, ColumnMeta, RelationInfo, RelationKind, ResultRow, SchemaInfo, ValueKind,
-    qualified_name, quote_identifier,
+    ColumnInfo, ColumnMeta, ForeignKeyInfo, IndexInfo, KeyInfo, ObjectRef, RelationDetails,
+    RelationInfo, RelationKind, ResultRow, RoutineInfo, RoutineKind, SchemaInfo, SchemaObjects,
+    TriggerInfo, ValueKind, qualified_name, quote_identifier,
 };
 pub use history::HistoryEntry;
 pub use query::{MAX_RESULT_BYTES, QueryRun, QueryRunEvent, QueryState, TruncationReason};
 pub use settings::{DatabaseEnvironment, DatabaseSslMode};
 pub use store::{
     CollectedResult, ConnectionStatus, DbStore, DbStoreEvent, PasswordInput, PasswordRequired,
-    QuerySource, Sessions,
+    QuerySource, SchemaRequest, Sessions,
 };
 
 pub fn init(cx: &mut App) {
