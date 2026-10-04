@@ -161,7 +161,9 @@ impl Stream for ResultStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.receiver).poll_next(cx);
-        if let Poll::Ready(None) = poll {
+        // A failed statement has already ended on the server. Cancelling it when the stream is
+        // dropped could hit the next statement of the session instead.
+        if let Poll::Ready(None | Some(Err(_))) = poll {
             self.finished = true;
         }
         poll
@@ -361,6 +363,53 @@ pub fn qualified_name(driver: DriverKind, schema: &str, relation: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingCancel(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl CancelHandle for RecordingCancel {
+        async fn cancel(&self) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropping_a_stream_cancels_only_running_statements() {
+        use futures::StreamExt as _;
+
+        // The producer is still running after sending its error, as when the stream is
+        // dropped right after the error arrives.
+        let cancel = Arc::new(RecordingCancel::default());
+        let mut stream = ResultStream::spawn(Some(cancel.clone()), |mut sender| async move {
+            sender.send(Err(anyhow::anyhow!("syntax error"))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        assert!(stream.next().await.is_some_and(|event| event.is_err()));
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancel.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed statement must not cancel the next one"
+        );
+
+        let cancel = Arc::new(RecordingCancel::default());
+        let mut stream = ResultStream::spawn(Some(cancel.clone()), |mut sender| async move {
+            sender.send(Ok(ResultEvent::Rows(Vec::new()))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        assert!(stream.next().await.is_some_and(|event| event.is_ok()));
+        drop(stream);
+        for _ in 0..100 {
+            if cancel.0.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cancel.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_quote_identifier() {
